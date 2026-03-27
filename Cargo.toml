@@ -7,6 +7,10 @@ edition = "2021"
 bytes = "1"
 prost = "0.13"
 flate2 = "1"
+h2 = "0.4"
+http = "1"
+tokio = { version = "1", features = ["net", "io-util", "rt", "sync"] }
 
 [dev-dependencies]
 prost = { version = "0.13", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

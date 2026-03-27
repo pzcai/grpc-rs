@@ -69,6 +69,18 @@ impl Status {
         Status::new(Code::Unavailable, msg)
     }
 
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Status::new(Code::NotFound, msg)
+    }
+
+    pub fn unauthenticated(msg: impl Into<String>) -> Self {
+        Status::new(Code::Unauthenticated, msg)
+    }
+
+    pub fn aborted(msg: impl Into<String>) -> Self {
+        Status::new(Code::Aborted, msg)
+    }
+
     pub fn is_ok(&self) -> bool {
         self.code == Code::Ok
     }
