@@ -8,7 +8,7 @@
 ---
 
 ## Current status
-Module 3 (Server core) — COMPLETE. Begin Module 4 (Client core).
+Modules 1–5 COMPLETE (codec, transport, server, client, unary RPC). Begin Module 6 (Metadata).
 
 ## Session log
 
@@ -92,8 +92,6 @@ grpc-go's `handleStream`: strip leading `/`, split at last `/` → `(service, me
 Content-type validation: must start with `application/grpc`; error code Unimplemented on
 unknown service/method (matching grpc-go), InvalidArgument on bad content-type.
 Graceful shutdown deferred; `serve` runs until its future is dropped.
-Module 5 (Unary RPC end-to-end) will be attempted in this same session.
-
 **Completed:**
 - `ServiceDesc` / `MethodDesc` / `UnaryHandlerFn` types
 - `Server::add_service` (panics on duplicate), `Server::serve(SocketAddr)`
@@ -104,8 +102,34 @@ Module 5 (Unary RPC end-to-end) will be attempted in this same session.
   paths — resolved by extracting owned Strings at top of `dispatch_stream`
 - 10 new tests (6 unit + 4 integration), all passing; total 50 tests
 
-**Next session — Module 4:** Client core — `Channel` (connection pool stub), `CallOptions`,
-`UnaryCall` helper. The `ClientTransport` from Module 2 is the low-level primitive; Module 4
-wraps it with reconnection and call creation. For now, implement a simple single-connection
-`Channel` (no reconnect yet) and a `call_unary` helper that handles the full request/response
-cycle in one function. This enables Module 5 end-to-end tests with prost-generated types.
+---
+
+### 2026-03-27 — Session 2 (continued): Client core + Unary RPC (Modules 4 + 5)
+
+**Plan:**
+Module 4: `Channel` wraps `ClientTransport` behind a `std::sync::Mutex` so multiple callers
+can create streams without `&mut` conflicts; `new_stream` only holds the lock during the
+synchronous part, releasing before any `.await`.  `Channel::connect(SocketAddr)` does the TCP
+connect, h2 handshake, and spawns the connection task internally.  `Channel::call_unary<Req,Resp>`
+does the complete unary RPC cycle (encode → send → recv_headers → recv_message → decode →
+recv_trailers → check status).  No reconnection, no load balancing, no subchannel pooling —
+these are deferred to a later session.
+Module 5: End-to-end integration tests using prost messages directly (`#[derive(prost::Message)]`
+inline structs), exercising the full stack: Channel → ClientTransport → TCP → Server → handler
+→ response. Success criterion: a "greeter" test that calls `SayHello` and verifies the reply.
+
+**Completed:**
+- `Channel` in `src/client.rs`: connects over TCP, spawns h2 conn task, wraps `ClientTransport`
+  behind `std::sync::Mutex` (held only for synchronous `new_stream`, not across `.await`)
+- `Channel::call_unary<Req,Resp>`: full unary cycle; fix: initially checked for empty body
+  before reading trailers, causing `Internal` for trailer-only error responses — fixed by
+  reading trailers first, then checking status, then checking for response body
+- Module 5: `say_hello_end_to_end` and 3 more integration tests pass end-to-end
+- 54 total tests passing
+
+**Next session — Module 6:** Metadata (headers and trailers). The transport layer already
+passes `HeaderMap` through; Module 6 formalizes the `Metadata` abstraction, adds metadata
+forwarding through `Channel::call_unary`, and makes the server handler receive and return
+metadata. Key behaviors from grpc-go: binary metadata keys end in `-bin` and are base64
+encoded; ASCII metadata is passed verbatim; filtered headers (`:*`, `host`, `connection`,
+`grpc-*` except `grpc-encoding`, `grpc-accept-encoding`, `grpc-timeout`) are removed.
