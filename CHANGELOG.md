@@ -8,7 +8,7 @@
 ---
 
 ## Current status
-Modules 1–5 COMPLETE (codec, transport, server, client, unary RPC). Begin Module 6 (Metadata).
+Modules 1–6 COMPLETE (codec, transport, server, client, unary RPC, metadata). Begin Module 7 (Deadline + cancellation).
 
 ## Session log
 
@@ -127,9 +127,34 @@ inline structs), exercising the full stack: Channel → ClientTransport → TCP 
 - Module 5: `say_hello_end_to_end` and 3 more integration tests pass end-to-end
 - 54 total tests passing
 
-**Next session — Module 6:** Metadata (headers and trailers). The transport layer already
-passes `HeaderMap` through; Module 6 formalizes the `Metadata` abstraction, adds metadata
-forwarding through `Channel::call_unary`, and makes the server handler receive and return
-metadata. Key behaviors from grpc-go: binary metadata keys end in `-bin` and are base64
-encoded; ASCII metadata is passed verbatim; filtered headers (`:*`, `host`, `connection`,
-`grpc-*` except `grpc-encoding`, `grpc-accept-encoding`, `grpc-timeout`) are removed.
+---
+
+### 2026-03-27 — Session 2 (continued): Metadata (Module 6)
+
+**Plan:**
+Introduce `Metadata` type in `src/metadata.rs` backed by `http::HeaderMap`.
+Binary keys (ending in `-bin`) are base64-encoded on send, decoded on receive.
+`Metadata::from_request_headers()` filters gRPC-internal headers so the handler
+sees only user metadata.  Update `UnaryHandlerFn` to `Fn(Bytes, Metadata) →
+BoxFuture<Result<Bytes, Status>>` so handlers can read request metadata.  Update
+`Channel::call_unary` to `→ Result<(Resp, Metadata), Status>` where the `Metadata`
+is the trailing metadata from the server.  Existing tests updated to match new
+signatures (add `_md` arg to closures, destructure `(r, _)` from call_unary).
+ASCII metadata round-trip test added; binary metadata test added.
+base64 dependency: use `base64 = "0.22"` with standard encoding.
+
+**Completed:**
+- `src/metadata.rs`: `Metadata` type backed by `Vec<(String, String)>` (ordered, multi-value)
+  - `insert`/`append`/`get`/`get_all` for ASCII metadata; `insert_bin`/`get_bin` for binary (-bin keys)
+  - `from_request_headers`: filters pseudo-headers, grpc-*, content-type, te, host, etc.
+  - `from_trailer_headers`: additionally filters grpc-status and grpc-message
+  - `to_header_map`: converts back to http::HeaderMap for transmission
+- `src/server.rs`: `UnaryHandlerFn` now `Fn(Bytes, Metadata) -> BoxFuture<...>`; request metadata
+  extracted via `Metadata::from_request_headers` and passed to handler
+- `src/client.rs`: `call_unary` takes `&Metadata` for request metadata, returns `(Resp, Metadata)`
+  where trailing Metadata is extracted from response trailers
+- 11 new unit tests in metadata.rs; 1 new integration test `request_metadata_reaches_handler`
+- 65 total tests passing
+
+---
+

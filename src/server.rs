@@ -29,6 +29,7 @@ use http::HeaderMap;
 use tokio::net::TcpListener;
 
 use crate::codec;
+use crate::metadata::Metadata;
 use crate::status::Status;
 use crate::transport::{ServerStream, ServerTransport};
 
@@ -39,13 +40,14 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 /// A unary RPC handler.
 ///
-/// - Input: the decoded request payload (raw protobuf bytes, no gRPC framing).
-/// - Output: the encoded response payload (raw protobuf bytes, no gRPC framing),
-///   or a [`Status`] error.
+/// - First arg: decoded request payload (raw protobuf bytes, no gRPC framing).
+/// - Second arg: request metadata (user-defined headers, gRPC-internal headers stripped).
+/// - Output: encoded response payload (raw protobuf bytes, no gRPC framing), or a
+///   [`Status`] error.  Response metadata is not yet supported (deferred).
 ///
 /// Implementations must be `Send + Sync` so they can be shared across tasks.
 pub type UnaryHandlerFn =
-    Arc<dyn Fn(Bytes) -> BoxFuture<Result<Bytes, Status>> + Send + Sync + 'static>;
+    Arc<dyn Fn(Bytes, Metadata) -> BoxFuture<Result<Bytes, Status>> + Send + Sync + 'static>;
 
 // ── Service description ───────────────────────────────────────────────────────
 
@@ -151,6 +153,8 @@ async fn dispatch_stream(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_owned();
+    // Extract user-defined request metadata (strips transport/gRPC-internal headers).
+    let request_metadata = Metadata::from_request_headers(stream.request_headers());
 
     // Validate content-type: must start with "application/grpc"
     if !content_type.starts_with("application/grpc") {
@@ -226,8 +230,8 @@ async fn dispatch_stream(
         }
     };
 
-    // Invoke handler
-    let response_payload = match handler(payload).await {
+    // Invoke handler (passes request metadata; response metadata not yet forwarded)
+    let response_payload = match handler(payload, request_metadata).await {
         Ok(b) => b,
         Err(e) => {
             send_error(&mut stream, e);
@@ -325,7 +329,7 @@ mod tests {
 
     /// Helper: build a simple echo unary handler that returns its input unchanged.
     fn echo_handler() -> UnaryHandlerFn {
-        Arc::new(|req: Bytes| {
+        Arc::new(|req: Bytes, _md: Metadata| {
             Box::pin(async move { Ok(req) })
         })
     }
@@ -436,7 +440,7 @@ mod tests {
             name: "test.Fail",
             methods: vec![MethodDesc {
                 name: "Fail",
-                handler: Arc::new(|_: Bytes| {
+                handler: Arc::new(|_: Bytes, _md: Metadata| {
                     Box::pin(async move {
                         Err(Status::not_found("thing not found"))
                     })
