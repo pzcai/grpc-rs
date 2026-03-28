@@ -11,23 +11,25 @@
 //! no load balancing).  These features are deferred until a later session.
 
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::TcpStream;
 
 use crate::codec;
+use crate::interceptor::{self, UnaryClientInterceptor};
 use crate::metadata::Metadata;
 use crate::status::Status;
-use crate::transport::{self, ClientTransport};
 use crate::tls;
+use crate::transport::{self, ClientTransport};
 
 /// A gRPC channel: a logical connection to a single server endpoint.
 ///
 /// Cheaply cloneable in the future (when backed by a connection pool); for now
 /// it holds one HTTP/2 connection.
 pub struct Channel {
-    transport: Mutex<ClientTransport>,
+    transport: Arc<Mutex<ClientTransport>>,
+    interceptors: Vec<UnaryClientInterceptor>,
 }
 
 impl Channel {
@@ -43,7 +45,8 @@ impl Channel {
         tokio::spawn(conn_fut);
 
         Ok(Channel {
-            transport: Mutex::new(transport),
+            transport: Arc::new(Mutex::new(transport)),
+            interceptors: Vec::new(),
         })
     }
 
@@ -71,8 +74,16 @@ impl Channel {
         tokio::spawn(conn_fut);
 
         Ok(Channel {
-            transport: Mutex::new(transport),
+            transport: Arc::new(Mutex::new(transport)),
+            interceptors: Vec::new(),
         })
+    }
+
+    /// Register a client-side unary interceptor.
+    ///
+    /// Interceptors are applied in registration order (first registered = outermost).
+    pub fn add_interceptor(&mut self, interceptor: UnaryClientInterceptor) {
+        self.interceptors.push(interceptor);
     }
 
     /// Make a unary RPC call.
@@ -119,7 +130,7 @@ impl Channel {
         Resp: prost::Message + Default,
     {
         // Encode the request with prost + 5-byte gRPC framing.
-        let req_frame = codec::encode_message(req, None)?;
+        let req_bytes = codec::encode_message(req, None)?;
 
         // Build request headers: user metadata + optional grpc-timeout.
         let mut header_map = metadata.to_header_map();
@@ -133,40 +144,44 @@ impl Channel {
             }
         }
 
-        // Acquire the transport lock only for the synchronous new_stream call.
-        let mut stream = {
-            let mut guard = self
-                .transport
-                .lock()
-                .map_err(|_| Status::internal("channel transport mutex poisoned"))?;
-            guard.new_stream(method, &header_map)?
-        };
+        // Build the terminal invoker: does the actual HTTP/2 round-trip.
+        let transport = Arc::clone(&self.transport);
+        let method_owned = method.to_owned();
+        let header_map_arc = Arc::new(header_map);
+        let terminal: interceptor::ClientNext = Arc::new(move |req_frame, _md| {
+            let transport = Arc::clone(&transport);
+            let method = method_owned.clone();
+            let header_map = Arc::clone(&header_map_arc);
+            Box::pin(async move {
+                let mut stream = {
+                    let mut guard = transport
+                        .lock()
+                        .map_err(|_| Status::internal("channel transport mutex poisoned"))?;
+                    guard.new_stream(&method, &header_map)?
+                };
 
-        // Send request (END_STREAM on the only message — this is a unary call).
-        stream.send_message(req_frame, true)?;
+                stream.send_message(req_frame, true)?;
+                stream.recv_headers().await?;
+                let resp_frame = stream.recv_message().await?;
+                let (rpc_status, raw_trailers) = stream.recv_trailers().await?;
+                if !rpc_status.is_ok() {
+                    return Err(rpc_status);
+                }
+                let frame = resp_frame
+                    .ok_or_else(|| Status::internal("server returned OK but sent no response body"))?;
+                let trailing_metadata = Metadata::from_trailer_headers(&raw_trailers);
+                Ok((frame, trailing_metadata))
+            })
+        });
 
-        // Receive response headers (blocks until server sends initial HEADERS).
-        stream.recv_headers().await?;
+        // Wrap terminal in the interceptor chain.
+        let chain = interceptor::chain_client(&self.interceptors, method.to_owned(), terminal);
 
-        // Receive the response data frame (None for trailer-only responses, e.g. errors).
-        let resp_frame = stream.recv_message().await?;
-
-        // Receive trailing HEADERS — always do this even if there was no data frame,
-        // so we surface the real gRPC status code (e.g. NotFound, Unimplemented).
-        let (rpc_status, raw_trailers) = stream.recv_trailers().await?;
-        if !rpc_status.is_ok() {
-            return Err(rpc_status);
-        }
-
-        // Status is OK — there must be a response frame to decode.
-        let frame = resp_frame
-            .ok_or_else(|| Status::internal("server returned OK but sent no response body"))?;
+        // Invoke the chain.
+        let (resp_frame, trailing_metadata) = chain(req_bytes, metadata.clone()).await?;
 
         // Decode response payload with prost.
-        let resp: Resp = codec::decode_message(&frame, None, codec::DEFAULT_MAX_RECV_SIZE)?;
-
-        // Extract user-defined trailing metadata (strips grpc-status, grpc-message).
-        let trailing_metadata = Metadata::from_trailer_headers(&raw_trailers);
+        let resp: Resp = codec::decode_message(&resp_frame, None, codec::DEFAULT_MAX_RECV_SIZE)?;
 
         Ok((resp, trailing_metadata))
     }
@@ -647,5 +662,94 @@ mod tests {
         // After close_send, server should exit its loop and send trailers.
         assert!(call.recv_message::<HelloReply>().await.unwrap().is_none());
         call.finish().await.unwrap();
+    }
+
+    // ── Module 10: Interceptors ───────────────────────────────────────────────
+
+    /// Client interceptor that adds a metadata header to every request.
+    #[tokio::test]
+    async fn client_interceptor_adds_metadata() {
+        use crate::interceptor::UnaryClientInterceptor;
+        use std::sync::{Arc, Mutex};
+
+        // Track which metadata the interceptor saw.
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen_clone = Arc::clone(&seen);
+
+        let interceptor: UnaryClientInterceptor = Arc::new(move |_method, req, mut md, next| {
+            let seen_clone = Arc::clone(&seen_clone);
+            Box::pin(async move {
+                md.insert("x-intercepted", "client-yes");
+                let result = next(req, md).await;
+                *seen_clone.lock().unwrap() = Some("ran".to_owned());
+                result
+            })
+        });
+
+        let addr = start_server(ServiceDesc {
+            name: "helloworld.Greeter",
+            methods: vec![MethodDesc { name: "SayHello", handler: Handler::Unary(greeter_handler()) }],
+        }).await;
+
+        let mut channel = Channel::connect(addr).await.unwrap();
+        channel.add_interceptor(interceptor);
+
+        let (reply, _): (HelloReply, _) = channel
+            .call_unary("/helloworld.Greeter/SayHello", &HelloRequest { name: "Intercepted".into() }, &Metadata::new(), None)
+            .await.unwrap();
+
+        assert_eq!(reply.message, "Hello, Intercepted!");
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("ran"));
+    }
+
+    /// Server interceptor that injects metadata and can short-circuit.
+    #[tokio::test]
+    async fn server_interceptor_short_circuits() {
+        use crate::interceptor::UnaryServerInterceptor;
+
+        // Interceptor that always returns PermissionDenied.
+        let interceptor: UnaryServerInterceptor = Arc::new(
+            |_method, _req, _md, _next| {
+                Box::pin(async move { Err(Status::new(crate::status::Code::PermissionDenied, "blocked")) })
+            }
+        );
+
+        let _addr = start_server(ServiceDesc {
+            name: "test.Blocked",
+            methods: vec![MethodDesc {
+                name: "Call",
+                handler: Handler::Unary(Arc::new(|_: Bytes, _md: Metadata| {
+                    Box::pin(async move { panic!("handler must not run") })
+                })),
+            }],
+        }).await;
+
+        // We need to add interceptors to a server, but `start_server` uses the simple helper.
+        // Test using our own server setup with an interceptor.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener.local_addr().unwrap();
+        drop(listener);
+
+        let mut server = crate::server::Server::new();
+        server.add_service(ServiceDesc {
+            name: "test.Guarded",
+            methods: vec![MethodDesc {
+                name: "Guarded",
+                handler: Handler::Unary(Arc::new(|_: Bytes, _md: Metadata| {
+                    Box::pin(async move { panic!("must not reach handler") })
+                })),
+            }],
+        });
+        server.add_interceptor(interceptor);
+        tokio::spawn(async move { server.serve(addr2).await.ok(); });
+        tokio::task::yield_now().await;
+
+        let channel = Channel::connect(addr2).await.unwrap();
+        let result: Result<(HelloReply, Metadata), Status> = channel
+            .call_unary("/test.Guarded/Guarded", &HelloRequest::default(), &Metadata::new(), None)
+            .await;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.code, crate::status::Code::PermissionDenied);
     }
 }

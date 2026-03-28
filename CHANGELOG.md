@@ -8,7 +8,7 @@
 ---
 
 ## Current status
-Modules 1–9 COMPLETE (codec, transport, server, client, unary RPC, metadata, deadline/cancellation, streaming RPCs, TLS). Begin Module 10 (Interceptors).
+Modules 1–10 COMPLETE (codec, transport, server, client, unary RPC, metadata, deadline/cancellation, streaming RPCs, TLS, interceptors). Begin Module 11 (Interop test binary).
 
 ## Session log
 
@@ -224,6 +224,31 @@ calling `rustls::crypto::ring::default_provider().install_default()` once per te
 - `rustls = "0.23"` + `tokio-rustls = "0.26"` in dependencies
 - Integration test `tls_unary_round_trip` passing end-to-end
 - 81 total tests passing
+
+---
+
+### 2026-03-27 — Session 2 (continued): Interceptors (Module 10)
+
+**Plan:**
+Add client and server unary interceptor chains matching grpc-go's `UnaryClientInterceptor` /
+`UnaryServerInterceptor` pattern.  Work at the raw-bytes level (no prost generics in interceptors)
+so the types are erasable.  `chain_server` / `chain_client` build the nested-closure chain
+(outermost interceptor first, handler last).  Server interceptors wrap `dispatch_unary` and see
+`(method, req_bytes, metadata, next)`.  Client interceptors sit in `call_unary_inner` around
+the terminal `ClientNext` invoker; this required changing `Channel.transport` from
+`Mutex<ClientTransport>` to `Arc<Mutex<ClientTransport>>` so the terminal closure could
+capture it.
+
+**Completed:**
+- `src/interceptor.rs`: `UnaryServerInterceptor`, `UnaryClientInterceptor`, `ServerNext`,
+  `ClientNext`, `chain_server`, `chain_client`
+- `Server::add_interceptor(UnaryServerInterceptor)` — interceptors stored in `Vec`
+  passed through to `dispatch_unary` via `Arc<Vec<...>>`
+- `Channel::add_interceptor(UnaryClientInterceptor)` — interceptors wrapped around
+  transport terminal in `call_unary_inner`
+- 5 unit tests in `interceptor.rs` (chain ordering, short-circuit, metadata mutation)
+- 2 integration tests: `client_interceptor_adds_metadata`, `server_interceptor_short_circuits`
+- 88 total tests passing
 
 ---
 

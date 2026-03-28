@@ -29,6 +29,7 @@ use http::HeaderMap;
 use tokio::net::TcpListener;
 
 use crate::codec;
+use crate::interceptor::{self, UnaryServerInterceptor};
 use crate::metadata::Metadata;
 use crate::status::Status;
 use crate::tls;
@@ -88,10 +89,12 @@ struct ServiceEntry {
 
 /// A gRPC server.
 ///
-/// Register services with [`add_service`](Server::add_service), then start
+/// Register services with [`add_service`](Server::add_service), optionally add
+/// interceptors with [`add_interceptor`](Server::add_interceptor), then start
 /// serving with [`serve`](Server::serve).
 pub struct Server {
     services: HashMap<&'static str, ServiceEntry>,
+    interceptors: Vec<UnaryServerInterceptor>,
 }
 
 impl Default for Server {
@@ -104,7 +107,16 @@ impl Server {
     pub fn new() -> Self {
         Server {
             services: HashMap::new(),
+            interceptors: Vec::new(),
         }
+    }
+
+    /// Register a unary server interceptor.
+    ///
+    /// Interceptors are applied in registration order (first registered = outermost).
+    /// Only affects unary RPC handlers; streaming handlers receive the stream directly.
+    pub fn add_interceptor(&mut self, interceptor: UnaryServerInterceptor) {
+        self.interceptors.push(interceptor);
     }
 
     /// Register a service. Panics if a service with the same name is already registered.
@@ -131,6 +143,7 @@ impl Server {
             .map_err(|e| Status::internal(format!("bind {addr}: {e}")))?;
 
         let services = Arc::new(self.services);
+        let interceptors = Arc::new(self.interceptors);
 
         loop {
             let (tcp, _peer) = listener
@@ -139,6 +152,7 @@ impl Server {
                 .map_err(|e| Status::internal(format!("TCP accept: {e}")))?;
 
             let services = Arc::clone(&services);
+            let interceptors = Arc::clone(&interceptors);
             tokio::spawn(async move {
                 let mut transport = match ServerTransport::new(tcp).await {
                     Ok(t) => t,
@@ -146,7 +160,8 @@ impl Server {
                 };
                 while let Some(stream) = transport.accept().await {
                     let services = Arc::clone(&services);
-                    tokio::spawn(dispatch_stream(stream, services));
+                    let interceptors = Arc::clone(&interceptors);
+                    tokio::spawn(dispatch_stream(stream, services, interceptors));
                 }
             });
         }
@@ -163,6 +178,7 @@ impl Server {
 
         let acceptor = tls::acceptor(tls_cfg);
         let services = Arc::new(self.services);
+        let interceptors = Arc::new(self.interceptors);
 
         loop {
             let (tcp, _peer) = listener
@@ -172,6 +188,7 @@ impl Server {
 
             let acceptor = acceptor.clone();
             let services = Arc::clone(&services);
+            let interceptors = Arc::clone(&interceptors);
             tokio::spawn(async move {
                 let tls_stream = match acceptor.accept(tcp).await {
                     Ok(s) => s,
@@ -183,7 +200,8 @@ impl Server {
                 };
                 while let Some(stream) = transport.accept().await {
                     let services = Arc::clone(&services);
-                    tokio::spawn(dispatch_stream(stream, services));
+                    let interceptors = Arc::clone(&interceptors);
+                    tokio::spawn(dispatch_stream(stream, services, interceptors));
                 }
             });
         }
@@ -195,6 +213,7 @@ impl Server {
 async fn dispatch_stream(
     mut stream: ServerStream,
     services: Arc<HashMap<&'static str, ServiceEntry>>,
+    interceptors: Arc<Vec<UnaryServerInterceptor>>,
 ) {
     // Extract all data we need from the stream headers up-front (owned),
     // so we can take &mut stream for error responses without borrow conflicts.
@@ -268,7 +287,7 @@ async fn dispatch_stream(
 
     match handler {
         Handler::Unary(handler) => {
-            dispatch_unary(stream, handler.clone(), request_metadata, deadline).await;
+            dispatch_unary(stream, handler.clone(), request_metadata, deadline, &interceptors, method_path.clone()).await;
         }
         Handler::Streaming(handler) => {
             // Streaming handlers own the stream entirely; dispatch directly.
@@ -289,6 +308,8 @@ async fn dispatch_unary(
     handler: UnaryHandlerFn,
     request_metadata: Metadata,
     deadline: Option<std::time::Duration>,
+    interceptors: &[UnaryServerInterceptor],
+    method_path: String,
 ) {
     // Read the request frame (first message; unary RPC has exactly one)
     let frame = match stream.recv_message().await {
@@ -312,14 +333,18 @@ async fn dispatch_unary(
         }
     };
 
-    // Invoke handler with optional server-side deadline.
+    // Build the interceptor chain around the handler (or use handler directly if no interceptors).
+    let terminal: interceptor::ServerNext = Arc::new(move |req, md| handler(req, md));
+    let chain = interceptor::chain_server(interceptors, method_path, terminal);
+
+    // Invoke chain with optional server-side deadline.
     let handler_result = if let Some(d) = deadline {
-        match tokio::time::timeout(d, handler(payload, request_metadata)).await {
+        match tokio::time::timeout(d, chain(payload, request_metadata)).await {
             Ok(r) => r,
             Err(_) => Err(Status::deadline_exceeded("server-side deadline exceeded")),
         }
     } else {
-        handler(payload, request_metadata).await
+        chain(payload, request_metadata).await
     };
     let response_payload = match handler_result {
         Ok(b) => b,

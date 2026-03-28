@@ -75,8 +75,6 @@ mod tests {
 
     use crate::metadata::Metadata;
     use crate::server::{Handler, MethodDesc, Server, ServiceDesc, UnaryHandlerFn};
-    use crate::status::Status;
-
     /// Generate a self-signed cert for `localhost` using `rcgen`.
     fn make_self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
