@@ -8,7 +8,7 @@
 ---
 
 ## Current status
-Module 2 (Transport layer) — COMPLETE. Begin Module 3 (Server core).
+Module 3 (Server core) — COMPLETE. Begin Module 4 (Client core).
 
 ## Session log
 
@@ -76,3 +76,36 @@ connection future. grpc-timeout parsing deferred to Module 3/4 (server/client co
 dispatch, service registry. Reads from `server.go`, `service_config.go` in grpc-go.
 Key behaviors to implement: ServiceDesc registration, method dispatch by path, content-type
 validation (must start with `application/grpc`), graceful shutdown.
+
+---
+
+### 2026-03-27 — Session 2: Server core (Module 3)
+
+**Plan (written before any code):**
+Implement Module 3: gRPC server core. This sits above the transport layer and handles
+RPC dispatch. Key types: `ServiceDesc { name, methods }` and `MethodDesc { name, handler }`
+where `UnaryHandlerFn = Arc<dyn Fn(Bytes) -> BoxFuture<Result<Bytes, Status>>>`.  Handlers
+receive the raw decoded protobuf bytes (no gRPC framing); the server core handles framing
+via the codec layer.  `Server::add_service` registers services by name; `Server::serve`
+binds a TCP listener and spawns per-connection + per-stream tasks.  Dispatch follows
+grpc-go's `handleStream`: strip leading `/`, split at last `/` → `(service, method)`.
+Content-type validation: must start with `application/grpc`; error code Unimplemented on
+unknown service/method (matching grpc-go), InvalidArgument on bad content-type.
+Graceful shutdown deferred; `serve` runs until its future is dropped.
+Module 5 (Unary RPC end-to-end) will be attempted in this same session.
+
+**Completed:**
+- `ServiceDesc` / `MethodDesc` / `UnaryHandlerFn` types
+- `Server::add_service` (panics on duplicate), `Server::serve(SocketAddr)`
+- `dispatch_stream`: content-type validation (InvalidArgument), path parsing (Unimplemented
+  on malformed/unknown service/unknown method), handler invocation, codec framing
+- `parse_method_path`: strips leading `/`, splits at last `/`, matches grpc-go behavior
+- Fix: borrow checker rejected using `stream.method()` alongside `&mut stream` in error
+  paths — resolved by extracting owned Strings at top of `dispatch_stream`
+- 10 new tests (6 unit + 4 integration), all passing; total 50 tests
+
+**Next session — Module 4:** Client core — `Channel` (connection pool stub), `CallOptions`,
+`UnaryCall` helper. The `ClientTransport` from Module 2 is the low-level primitive; Module 4
+wraps it with reconnection and call creation. For now, implement a simple single-connection
+`Channel` (no reconnect yet) and a `call_unary` helper that handles the full request/response
+cycle in one function. This enables Module 5 end-to-end tests with prost-generated types.
