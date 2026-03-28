@@ -22,10 +22,65 @@ pub mod server;
 pub use client::{ClientStream, ClientTransport};
 pub use server::{ServerStream, ServerTransport};
 
+use std::time::Duration;
+
 use bytes::{Bytes, BytesMut};
 
 use crate::codec::HEADER_LEN;
 use crate::status::Status;
+
+// ── gRPC timeout wire encoding ────────────────────────────────────────────────
+
+/// Encode a `Duration` as a gRPC `grpc-timeout` header value.
+///
+/// Format: `<integer><unit>` where unit is one of `H`, `M`, `S`, `m`, `u`, `n`
+/// (hours, minutes, seconds, milliseconds, microseconds, nanoseconds).
+/// We choose the coarsest unit that fits in a u64 with at most 8 digits
+/// (grpc-go uses the same strategy: pick the largest unit where the value
+/// is a whole number and < 10^8).
+pub(crate) fn encode_timeout(d: Duration) -> String {
+    let nanos = d.as_nanos();
+    // Largest unit first: hours, minutes, seconds, millis, micros, nanos
+    let units: &[(u128, char)] = &[
+        (3_600_000_000_000, 'H'),
+        (60_000_000_000, 'M'),
+        (1_000_000_000, 'S'),
+        (1_000_000, 'm'),
+        (1_000, 'u'),
+        (1, 'n'),
+    ];
+    for &(unit_nanos, suffix) in units {
+        if nanos % unit_nanos == 0 {
+            let value = nanos / unit_nanos;
+            if value < 100_000_000 {
+                return format!("{value}{suffix}");
+            }
+        }
+    }
+    // Fallback: nanoseconds (always exact)
+    format!("{}n", nanos)
+}
+
+/// Decode a gRPC `grpc-timeout` header value into a `Duration`.
+///
+/// Returns `None` if the format is unrecognised or the integer overflows.
+pub(crate) fn decode_timeout(s: &str) -> Option<Duration> {
+    if s.is_empty() {
+        return None;
+    }
+    let suffix = s.chars().last()?;
+    let num_str = &s[..s.len() - 1];
+    let value: u64 = num_str.parse().ok()?;
+    match suffix {
+        'H' => Some(Duration::from_secs(value * 3600)),
+        'M' => Some(Duration::from_secs(value * 60)),
+        'S' => Some(Duration::from_secs(value)),
+        'm' => Some(Duration::from_millis(value)),
+        'u' => Some(Duration::from_micros(value)),
+        'n' => Some(Duration::from_nanos(value)),
+        _ => None,
+    }
+}
 
 /// Try to extract one complete gRPC frame from the buffer.
 ///
@@ -50,6 +105,63 @@ pub(crate) fn try_extract_frame(buf: &mut BytesMut) -> Result<Option<Bytes>, Sta
 mod tests {
     use super::*;
     use bytes::BufMut;
+    use std::time::Duration;
+
+    // ── timeout encoding ──────────────────────────────────────────────────────
+
+    #[test]
+    fn encode_timeout_hours() {
+        assert_eq!(encode_timeout(Duration::from_secs(7200)), "2H");
+    }
+
+    #[test]
+    fn encode_timeout_minutes() {
+        assert_eq!(encode_timeout(Duration::from_secs(120)), "2M");
+    }
+
+    #[test]
+    fn encode_timeout_seconds() {
+        assert_eq!(encode_timeout(Duration::from_secs(5)), "5S");
+    }
+
+    #[test]
+    fn encode_timeout_millis() {
+        assert_eq!(encode_timeout(Duration::from_millis(250)), "250m");
+    }
+
+    #[test]
+    fn encode_timeout_micros() {
+        assert_eq!(encode_timeout(Duration::from_micros(500)), "500u");
+    }
+
+    #[test]
+    fn encode_timeout_nanos() {
+        assert_eq!(encode_timeout(Duration::from_nanos(100)), "100n");
+    }
+
+    #[test]
+    fn decode_timeout_roundtrip_millis() {
+        let d = Duration::from_millis(500);
+        let encoded = encode_timeout(d);
+        assert_eq!(decode_timeout(&encoded), Some(d));
+    }
+
+    #[test]
+    fn decode_timeout_roundtrip_seconds() {
+        let d = Duration::from_secs(30);
+        let encoded = encode_timeout(d);
+        assert_eq!(decode_timeout(&encoded), Some(d));
+    }
+
+    #[test]
+    fn decode_timeout_bad_suffix_returns_none() {
+        assert_eq!(decode_timeout("100x"), None);
+    }
+
+    #[test]
+    fn decode_timeout_empty_returns_none() {
+        assert_eq!(decode_timeout(""), None);
+    }
 
     #[test]
     fn extract_frame_empty_buf() {

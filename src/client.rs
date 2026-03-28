@@ -12,13 +12,14 @@
 
 use std::net::SocketAddr;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use tokio::net::TcpStream;
 
 use crate::codec;
 use crate::metadata::Metadata;
 use crate::status::Status;
-use crate::transport::ClientTransport;
+use crate::transport::{self, ClientTransport};
 
 /// A gRPC channel: a logical connection to a single server endpoint.
 ///
@@ -47,11 +48,11 @@ impl Channel {
 
     /// Make a unary RPC call.
     ///
-    /// Make a unary RPC call.
-    ///
     /// - `method`: the full method path, e.g. `"/helloworld.Greeter/SayHello"`.
     /// - `req`: the request message (serialized with prost).
     /// - `metadata`: request metadata (user-defined headers).
+    /// - `timeout`: optional deadline for the entire call; returns
+    ///   `Status::deadline_exceeded` if it fires.
     ///
     /// Returns `(response, trailing_metadata)` on success, or a [`Status`] error.
     /// The trailing metadata contains any user-defined headers the server sent in
@@ -61,6 +62,28 @@ impl Channel {
         method: &str,
         req: &Req,
         metadata: &Metadata,
+        timeout: Option<Duration>,
+    ) -> Result<(Resp, Metadata), Status>
+    where
+        Req: prost::Message,
+        Resp: prost::Message + Default,
+    {
+        let fut = self.call_unary_inner(method, req, metadata, timeout);
+        match timeout {
+            Some(d) => match tokio::time::timeout(d, fut).await {
+                Ok(result) => result,
+                Err(_) => Err(Status::deadline_exceeded("RPC deadline exceeded")),
+            },
+            None => fut.await,
+        }
+    }
+
+    async fn call_unary_inner<Req, Resp>(
+        &self,
+        method: &str,
+        req: &Req,
+        metadata: &Metadata,
+        timeout: Option<Duration>,
     ) -> Result<(Resp, Metadata), Status>
     where
         Req: prost::Message,
@@ -69,8 +92,17 @@ impl Channel {
         // Encode the request with prost + 5-byte gRPC framing.
         let req_frame = codec::encode_message(req, None)?;
 
-        // Convert Metadata to HeaderMap for the h2 request headers.
-        let header_map = metadata.to_header_map();
+        // Build request headers: user metadata + optional grpc-timeout.
+        let mut header_map = metadata.to_header_map();
+        if let Some(d) = timeout {
+            let timeout_str = transport::encode_timeout(d);
+            if let Ok(val) = timeout_str.parse::<http::header::HeaderValue>() {
+                header_map.insert(
+                    http::header::HeaderName::from_static("grpc-timeout"),
+                    val,
+                );
+            }
+        }
 
         // Acquire the transport lock only for the synchronous new_stream call.
         let mut stream = {
@@ -181,7 +213,7 @@ mod tests {
 
         let channel = Channel::connect(addr).await.unwrap();
         let (reply, _): (HelloReply, _) = channel
-            .call_unary("/helloworld.Greeter/SayHello", &HelloRequest { name: "World".into() }, &Metadata::new())
+            .call_unary("/helloworld.Greeter/SayHello", &HelloRequest { name: "World".into() }, &Metadata::new(), None)
             .await.unwrap();
         assert_eq!(reply.message, "Hello, World!");
     }
@@ -196,7 +228,7 @@ mod tests {
         let channel = Channel::connect(addr).await.unwrap();
         for name in &["Alice", "Bob", "Carol"] {
             let (reply, _): (HelloReply, _) = channel
-                .call_unary("/helloworld.Greeter/SayHello", &HelloRequest { name: name.to_string() }, &Metadata::new())
+                .call_unary("/helloworld.Greeter/SayHello", &HelloRequest { name: name.to_string() }, &Metadata::new(), None)
                 .await.unwrap();
             assert_eq!(reply.message, format!("Hello, {name}!"));
         }
@@ -216,7 +248,7 @@ mod tests {
 
         let channel = Channel::connect(addr).await.unwrap();
         let result: Result<(HelloReply, Metadata), Status> = channel
-            .call_unary("/test.Fail/Fail", &HelloRequest::default(), &Metadata::new())
+            .call_unary("/test.Fail/Fail", &HelloRequest::default(), &Metadata::new(), None)
             .await;
         let err = result.unwrap_err();
         assert_eq!(err.code, Code::NotFound);
@@ -232,7 +264,7 @@ mod tests {
 
         let channel = Channel::connect(addr).await.unwrap();
         let result: Result<(HelloReply, Metadata), Status> = channel
-            .call_unary("/helloworld.Greeter/SayGoodbye", &HelloRequest::default(), &Metadata::new())
+            .call_unary("/helloworld.Greeter/SayGoodbye", &HelloRequest::default(), &Metadata::new(), None)
             .await;
         assert_eq!(result.unwrap_err().code, Code::Unimplemented);
     }
@@ -257,7 +289,7 @@ mod tests {
             }],
         }).await;
 
-        let channel = Channel::connect(addr).await.unwrap();
+        let _channel = Channel::connect(addr).await.unwrap();
 
         let mut req_meta = Metadata::new();
         req_meta.insert("x-client-id", "test-client-42");
@@ -282,5 +314,61 @@ mod tests {
 
         let (status, _) = stream.recv_trailers().await.unwrap();
         assert!(status.is_ok());
+    }
+
+    // ── Module 7: Deadline / cancellation ────────────────────────────────────
+
+    /// A call with a very short timeout against a slow handler returns DeadlineExceeded.
+    #[tokio::test]
+    async fn deadline_exceeded_on_slow_handler() {
+        use std::time::Duration;
+
+        let addr = start_server(ServiceDesc {
+            name: "test.Slow",
+            methods: vec![MethodDesc {
+                name: "Slow",
+                handler: Arc::new(|_: Bytes, _md: Metadata| {
+                    Box::pin(async move {
+                        // Sleep much longer than the client timeout.
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        Ok(Bytes::new())
+                    })
+                }),
+            }],
+        }).await;
+
+        let channel = Channel::connect(addr).await.unwrap();
+        let result: Result<(HelloReply, Metadata), Status> = channel
+            .call_unary(
+                "/test.Slow/Slow",
+                &HelloRequest::default(),
+                &Metadata::new(),
+                Some(Duration::from_millis(50)),
+            )
+            .await;
+        assert_eq!(result.unwrap_err().code, crate::status::Code::DeadlineExceeded);
+    }
+
+    /// A call with a generous timeout completes normally.
+    #[tokio::test]
+    async fn call_with_timeout_succeeds_before_deadline() {
+        use std::time::Duration;
+
+        let addr = start_server(ServiceDesc {
+            name: "helloworld.Greeter",
+            methods: vec![MethodDesc { name: "SayHello", handler: greeter_handler() }],
+        }).await;
+
+        let channel = Channel::connect(addr).await.unwrap();
+        let (reply, _): (HelloReply, _) = channel
+            .call_unary(
+                "/helloworld.Greeter/SayHello",
+                &HelloRequest { name: "Timeout".into() },
+                &Metadata::new(),
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.message, "Hello, Timeout!");
     }
 }

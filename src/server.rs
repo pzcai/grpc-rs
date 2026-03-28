@@ -31,7 +31,7 @@ use tokio::net::TcpListener;
 use crate::codec;
 use crate::metadata::Metadata;
 use crate::status::Status;
-use crate::transport::{ServerStream, ServerTransport};
+use crate::transport::{self, ServerStream, ServerTransport};
 
 // ── Handler types ─────────────────────────────────────────────────────────────
 
@@ -153,6 +153,12 @@ async fn dispatch_stream(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_owned();
+    // Parse optional grpc-timeout header → server-side deadline.
+    let deadline: Option<std::time::Duration> = stream
+        .request_headers()
+        .get("grpc-timeout")
+        .and_then(|v| v.to_str().ok())
+        .and_then(transport::decode_timeout);
     // Extract user-defined request metadata (strips transport/gRPC-internal headers).
     let request_metadata = Metadata::from_request_headers(stream.request_headers());
 
@@ -230,8 +236,16 @@ async fn dispatch_stream(
         }
     };
 
-    // Invoke handler (passes request metadata; response metadata not yet forwarded)
-    let response_payload = match handler(payload, request_metadata).await {
+    // Invoke handler with optional server-side deadline.
+    let handler_result = if let Some(d) = deadline {
+        match tokio::time::timeout(d, handler(payload, request_metadata)).await {
+            Ok(r) => r,
+            Err(_) => Err(Status::deadline_exceeded("server-side deadline exceeded")),
+        }
+    } else {
+        handler(payload, request_metadata).await
+    };
+    let response_payload = match handler_result {
         Ok(b) => b,
         Err(e) => {
             send_error(&mut stream, e);

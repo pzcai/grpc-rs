@@ -8,7 +8,7 @@
 ---
 
 ## Current status
-Modules 1–6 COMPLETE (codec, transport, server, client, unary RPC, metadata). Begin Module 7 (Deadline + cancellation).
+Modules 1–7 COMPLETE (codec, transport, server, client, unary RPC, metadata, deadline/cancellation). Begin Module 8 (Streaming RPCs).
 
 ## Session log
 
@@ -155,6 +155,29 @@ base64 dependency: use `base64 = "0.22"` with standard encoding.
   where trailing Metadata is extracted from response trailers
 - 11 new unit tests in metadata.rs; 1 new integration test `request_metadata_reaches_handler`
 - 65 total tests passing
+
+---
+
+### 2026-03-27 — Session 2 (continued): Deadline + cancellation (Module 7)
+
+**Plan:**
+Map `context.Context` deadline from grpc-go to `Option<Duration>` timeout on `call_unary`.
+Client: wrap the entire RPC in `tokio::time::timeout`; if it fires, return `DeadlineExceeded`.
+Also encode the timeout as `grpc-timeout` header on the wire so the server can enforce it.
+Server: parse `grpc-timeout` header using grpc-go's unit format (`H/M/S/m/u/n`), wrap handler
+invocation in `tokio::time::timeout`, return `DeadlineExceeded` on expiry.
+Wire helpers `encode_timeout`/`decode_timeout` in `transport/mod.rs`.
+Added `time` feature to tokio in both `[dependencies]` and `[dev-dependencies]`.
+
+**Completed:**
+- `transport::encode_timeout(Duration) -> String`: picks coarsest whole-number unit < 10^8
+- `transport::decode_timeout(s: &str) -> Option<Duration>`: parses `<int><unit>` format
+- `Channel::call_unary` gains `timeout: Option<Duration>` parameter; wraps RPC in
+  `tokio::time::timeout` and encodes `grpc-timeout` header on the wire
+- `dispatch_stream` parses `grpc-timeout` header and wraps handler call in deadline
+- 10 new unit tests for timeout encoding/decoding; 2 new integration tests
+  (`deadline_exceeded_on_slow_handler`, `call_with_timeout_succeeds_before_deadline`)
+- 77 total tests passing
 
 ---
 
