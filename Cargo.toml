@@ -5,11 +5,11 @@ edition = "2021"
 
 [dependencies]
 bytes = "1"
-prost = "0.13"
+prost = { version = "0.13", features = ["derive"] }
 flate2 = "1"
 h2 = "0.4"
 http = "1"
-tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio-rustls = "0.26"

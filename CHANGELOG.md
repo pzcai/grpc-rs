@@ -8,7 +8,9 @@
 ---
 
 ## Current status
-Modules 1–10 COMPLETE (codec, transport, server, client, unary RPC, metadata, deadline/cancellation, streaming RPCs, TLS, interceptors). Begin Module 11 (Interop test binary).
+ALL MODULES COMPLETE (1–11). 94 tests passing. Core gRPC library fully functional:
+codec, transport, server, client, unary/streaming RPCs, metadata, deadline/cancellation,
+TLS (rustls), interceptors, interop test binary. Next: run against grpc-go reference server.
 
 ## Session log
 
@@ -249,6 +251,33 @@ capture it.
 - 5 unit tests in `interceptor.rs` (chain ordering, short-circuit, metadata mutation)
 - 2 integration tests: `client_interceptor_adds_metadata`, `server_interceptor_short_circuits`
 - 88 total tests passing
+
+---
+
+### 2026-03-27 — Session 2 (continued): Interop test binary (Module 11)
+
+**Plan:**
+Create `src/bin/interop.rs` with inline prost message definitions matching
+`grpc/testing/test.proto` (no proto compiler needed).  Binary supports both
+`--mode=client` and `--mode=server`.  Test cases: `empty_unary`, `large_unary`,
+`client_streaming`, `server_streaming`, `ping_pong`, `empty_stream`, `all`.
+Server implements `grpc.testing.TestService` covering all four RPC call types.
+In-process self-tests (`#[tokio::test]`) exercise each test case without needing
+a running grpc-go reference server.
+
+**Completed:**
+- `src/bin/interop.rs`: 6 test cases + interop server + CLI argument parser
+- All prost messages inline: `Empty`, `SimpleRequest/Response`, `Payload`,
+  `StreamingInputCallRequest/Response`, `ResponseParameters`,
+  `StreamingOutputCallRequest/Response`
+- `prost = { features = ["derive"] }` moved to `[dependencies]` for binary use
+- `tokio` `rt-multi-thread` + `macros` features added to `[dependencies]`
+- 6 new in-process interop tests all passing
+- 94 total tests passing (88 library + 6 interop)
+
+**Next:** Run the interop binary against a live grpc-go reference server to validate
+cross-implementation compatibility. Command:
+  `cargo run --bin interop -- --mode=client --server_host=localhost --server_port=10000 --test_case=all`
 
 ---
 
