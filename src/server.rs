@@ -31,6 +31,7 @@ use tokio::net::TcpListener;
 use crate::codec;
 use crate::metadata::Metadata;
 use crate::status::Status;
+use crate::tls;
 use crate::transport::{self, ServerStream, ServerTransport};
 
 // ── Handler types ─────────────────────────────────────────────────────────────
@@ -140,6 +141,43 @@ impl Server {
             let services = Arc::clone(&services);
             tokio::spawn(async move {
                 let mut transport = match ServerTransport::new(tcp).await {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                while let Some(stream) = transport.accept().await {
+                    let services = Arc::clone(&services);
+                    tokio::spawn(dispatch_stream(stream, services));
+                }
+            });
+        }
+    }
+
+    /// Bind `addr` with TLS and serve until the returned future is dropped.
+    ///
+    /// - `tls_cfg`: a rustls `ServerConfig`; ALPN `h2` must be included
+    ///   (use [`crate::tls::server_config_from_cert`] to build one).
+    pub async fn serve_tls(self, addr: SocketAddr, tls_cfg: tls::ServerConfig) -> Result<(), Status> {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| Status::internal(format!("bind {addr}: {e}")))?;
+
+        let acceptor = tls::acceptor(tls_cfg);
+        let services = Arc::new(self.services);
+
+        loop {
+            let (tcp, _peer) = listener
+                .accept()
+                .await
+                .map_err(|e| Status::internal(format!("TCP accept: {e}")))?;
+
+            let acceptor = acceptor.clone();
+            let services = Arc::clone(&services);
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(tcp).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let mut transport = match ServerTransport::new(tls_stream).await {
                     Ok(t) => t,
                     Err(_) => return,
                 };

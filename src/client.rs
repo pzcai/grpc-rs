@@ -20,6 +20,7 @@ use crate::codec;
 use crate::metadata::Metadata;
 use crate::status::Status;
 use crate::transport::{self, ClientTransport};
+use crate::tls;
 
 /// A gRPC channel: a logical connection to a single server endpoint.
 ///
@@ -39,6 +40,34 @@ impl Channel {
             .map_err(|e| Status::unavailable(format!("connect {addr}: {e}")))?;
 
         let (transport, conn_fut) = ClientTransport::connect(tcp).await?;
+        tokio::spawn(conn_fut);
+
+        Ok(Channel {
+            transport: Mutex::new(transport),
+        })
+    }
+
+    /// Connect to a gRPC server at `addr` over TLS.
+    ///
+    /// - `server_name`: the SNI hostname for TLS certificate verification.
+    /// - `tls_cfg`: a rustls `ClientConfig`; ALPN `h2` must be included
+    ///   (use [`crate::tls::client_config_from_roots`] to build one).
+    pub async fn connect_tls(
+        addr: SocketAddr,
+        server_name: tls::TlsServerName<'static>,
+        tls_cfg: tls::ClientConfig,
+    ) -> Result<Self, Status> {
+        let tcp = TcpStream::connect(addr)
+            .await
+            .map_err(|e| Status::unavailable(format!("connect {addr}: {e}")))?;
+
+        let connector = tls::connector(tls_cfg);
+        let tls_stream = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| Status::unavailable(format!("TLS handshake: {e}")))?;
+
+        let (transport, conn_fut) = ClientTransport::connect(tls_stream).await?;
         tokio::spawn(conn_fut);
 
         Ok(Channel {

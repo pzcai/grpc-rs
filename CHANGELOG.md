@@ -8,7 +8,7 @@
 ---
 
 ## Current status
-Modules 1–8 COMPLETE (codec, transport, server, client, unary RPC, metadata, deadline/cancellation, streaming RPCs). Begin Module 9 (TLS).
+Modules 1–9 COMPLETE (codec, transport, server, client, unary RPC, metadata, deadline/cancellation, streaming RPCs, TLS). Begin Module 10 (Interceptors).
 
 ## Session log
 
@@ -202,6 +202,28 @@ callers updated to `Handler::Unary(...)`.
 - 3 new end-to-end integration tests: `server_streaming_multiple_responses`,
   `client_streaming_accumulate_names`, `bidi_streaming_echo`
 - 80 total tests passing
+
+---
+
+### 2026-03-27 — Session 2 (continued): TLS (Module 9)
+
+**Plan:**
+Add `rustls` + `tokio-rustls` to support gRPC over TLS.  New `src/tls.rs` module provides
+helper constructors for `ClientConfig` / `ServerConfig` with ALPN `h2` pre-configured.
+`Channel::connect_tls` and `Server::serve_tls` are thin wrappers that do the TLS handshake
+(via `TlsConnector` / `TlsAcceptor`) before passing the resulting stream to the existing
+`ClientTransport::connect` / `ServerTransport::new` — the entire HTTP/2 and gRPC stack above
+is unchanged.  Test uses `rcgen` to generate a self-signed cert for `localhost`; requires
+calling `rustls::crypto::ring::default_provider().install_default()` once per test process.
+
+**Completed:**
+- `src/tls.rs`: `client_config_from_roots`, `server_config_from_cert`, `connector`, `acceptor`
+- `Channel::connect_tls(addr, server_name, ClientConfig) -> Result<Self>`
+- `Server::serve_tls(addr, ServerConfig) -> Result<(), Status>`
+- `rcgen = "0.13"` added as dev-dependency for self-signed cert generation
+- `rustls = "0.23"` + `tokio-rustls = "0.26"` in dependencies
+- Integration test `tls_unary_round_trip` passing end-to-end
+- 81 total tests passing
 
 ---
 

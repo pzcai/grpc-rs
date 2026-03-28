@@ -3,4 +3,5 @@ pub mod codec;
 pub mod metadata;
 pub mod server;
 pub mod status;
+pub mod tls;
 pub mod transport;
