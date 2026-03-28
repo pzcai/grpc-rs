@@ -8,7 +8,7 @@
 ---
 
 ## Current status
-Modules 1–7 COMPLETE (codec, transport, server, client, unary RPC, metadata, deadline/cancellation). Begin Module 8 (Streaming RPCs).
+Modules 1–8 COMPLETE (codec, transport, server, client, unary RPC, metadata, deadline/cancellation, streaming RPCs). Begin Module 9 (TLS).
 
 ## Session log
 
@@ -178,6 +178,30 @@ Added `time` feature to tokio in both `[dependencies]` and `[dev-dependencies]`.
 - 10 new unit tests for timeout encoding/decoding; 2 new integration tests
   (`deadline_exceeded_on_slow_handler`, `call_with_timeout_succeeds_before_deadline`)
 - 77 total tests passing
+
+---
+
+### 2026-03-27 — Session 2 (continued): Streaming RPCs (Module 8)
+
+**Plan:**
+Extend the server dispatch model with a `Handler` enum: `Unary(UnaryHandlerFn)` or
+`Streaming(StreamingHandlerFn)`.  `StreamingHandlerFn = Arc<dyn Fn(ServerStream, Metadata) ->
+BoxFuture<()>>` — the handler owns the `ServerStream` and drives it directly (read/write/close).
+On the client side, add `StreamCall` wrapping `ClientStream` with typed `send_message<Req>`,
+`recv_message<Resp>`, `close_send`, and `finish` methods.  `Channel::new_streaming_call` opens
+the h2 stream without sending a request body, returning a `StreamCall`.  All four gRPC call
+types (unary already done; server-streaming, client-streaming, bidi-streaming added here) are
+now supported.  `MethodDesc.handler` changed from `UnaryHandlerFn` to `Handler` — all existing
+callers updated to `Handler::Unary(...)`.
+
+**Completed:**
+- `Handler` enum (`Unary` / `Streaming`) in `server.rs`; `StreamingHandlerFn` type
+- `dispatch_stream` routes to `dispatch_unary` (old path) or hands `ServerStream` to streaming handler
+- `StreamCall` in `client.rs` with typed send/recv/close_send/finish
+- `Channel::new_streaming_call(method, metadata, timeout) -> Result<StreamCall>`
+- 3 new end-to-end integration tests: `server_streaming_multiple_responses`,
+  `client_streaming_accumulate_names`, `bidi_streaming_echo`
+- 80 total tests passing
 
 ---
 

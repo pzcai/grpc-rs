@@ -43,19 +43,33 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// - First arg: decoded request payload (raw protobuf bytes, no gRPC framing).
 /// - Second arg: request metadata (user-defined headers, gRPC-internal headers stripped).
 /// - Output: encoded response payload (raw protobuf bytes, no gRPC framing), or a
-///   [`Status`] error.  Response metadata is not yet supported (deferred).
+///   [`Status`] error.
 ///
 /// Implementations must be `Send + Sync` so they can be shared across tasks.
 pub type UnaryHandlerFn =
     Arc<dyn Fn(Bytes, Metadata) -> BoxFuture<Result<Bytes, Status>> + Send + Sync + 'static>;
 
+/// A streaming RPC handler.
+///
+/// Receives the raw `ServerStream` (after header validation and metadata extraction)
+/// plus the request metadata.  The handler is responsible for calling `recv_message`,
+/// `send_headers`, `send_message`, and `send_trailers` on the stream itself.
+pub type StreamingHandlerFn =
+    Arc<dyn Fn(ServerStream, Metadata) -> BoxFuture<()> + Send + Sync + 'static>;
+
+/// Discriminates between unary and streaming method handlers.
+pub enum Handler {
+    Unary(UnaryHandlerFn),
+    Streaming(StreamingHandlerFn),
+}
+
 // ── Service description ───────────────────────────────────────────────────────
 
-/// Descriptor for a single unary RPC method.
+/// Descriptor for a single RPC method (unary or streaming).
 pub struct MethodDesc {
     /// The bare method name, e.g. `"SayHello"`.
     pub name: &'static str,
-    pub handler: UnaryHandlerFn,
+    pub handler: Handler,
 }
 
 /// Descriptor for a gRPC service.
@@ -68,7 +82,7 @@ pub struct ServiceDesc {
 // ── Server ────────────────────────────────────────────────────────────────────
 
 struct ServiceEntry {
-    methods: HashMap<&'static str, UnaryHandlerFn>,
+    methods: HashMap<&'static str, Handler>,
 }
 
 /// A gRPC server.
@@ -202,7 +216,7 @@ async fn dispatch_stream(
 
     // Look up method
     let handler = match service.methods.get(method_name.as_str()) {
-        Some(h) => Arc::clone(h),
+        Some(h) => h,
         None => {
             send_error(
                 &mut stream,
@@ -214,6 +228,30 @@ async fn dispatch_stream(
         }
     };
 
+    match handler {
+        Handler::Unary(handler) => {
+            dispatch_unary(stream, handler.clone(), request_metadata, deadline).await;
+        }
+        Handler::Streaming(handler) => {
+            // Streaming handlers own the stream entirely; dispatch directly.
+            let handler = handler.clone();
+            if let Some(d) = deadline {
+                tokio::time::timeout(d, handler(stream, request_metadata))
+                    .await
+                    .ok();
+            } else {
+                handler(stream, request_metadata).await;
+            }
+        }
+    }
+}
+
+async fn dispatch_unary(
+    mut stream: ServerStream,
+    handler: UnaryHandlerFn,
+    request_metadata: Metadata,
+    deadline: Option<std::time::Duration>,
+) {
     // Read the request frame (first message; unary RPC has exactly one)
     let frame = match stream.recv_message().await {
         Ok(Some(f)) => f,
@@ -356,7 +394,7 @@ mod tests {
             name: "test.Echo",
             methods: vec![MethodDesc {
                 name: "Echo",
-                handler: echo_handler(),
+                handler: Handler::Unary(echo_handler()),
             }],
         });
 
@@ -454,11 +492,11 @@ mod tests {
             name: "test.Fail",
             methods: vec![MethodDesc {
                 name: "Fail",
-                handler: Arc::new(|_: Bytes, _md: Metadata| {
+                handler: Handler::Unary(Arc::new(|_: Bytes, _md: Metadata| {
                     Box::pin(async move {
                         Err(Status::not_found("thing not found"))
                     })
-                }),
+                })),
             }],
         });
 

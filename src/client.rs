@@ -141,6 +141,100 @@ impl Channel {
 
         Ok((resp, trailing_metadata))
     }
+
+    /// Open a streaming RPC call (server-streaming, client-streaming, or bidi).
+    ///
+    /// Returns a [`StreamCall`] that the caller uses to send/receive messages.
+    /// The initial request HEADERS are sent immediately; the caller must send
+    /// at least one message (or call [`StreamCall::close_send`]) before the server
+    /// will respond.
+    pub fn new_streaming_call(
+        &self,
+        method: &str,
+        metadata: &Metadata,
+        timeout: Option<Duration>,
+    ) -> Result<StreamCall, Status> {
+        let mut header_map = metadata.to_header_map();
+        if let Some(d) = timeout {
+            let timeout_str = transport::encode_timeout(d);
+            if let Ok(val) = timeout_str.parse::<http::header::HeaderValue>() {
+                header_map.insert(
+                    http::header::HeaderName::from_static("grpc-timeout"),
+                    val,
+                );
+            }
+        }
+        let stream = {
+            let mut guard = self
+                .transport
+                .lock()
+                .map_err(|_| Status::internal("channel transport mutex poisoned"))?;
+            guard.new_stream(method, &header_map)?
+        };
+        Ok(StreamCall { stream, headers_received: false })
+    }
+}
+
+// ── StreamCall ────────────────────────────────────────────────────────────────
+
+/// A handle for a streaming gRPC call (server-streaming, client-streaming, or bidi).
+///
+/// Use [`send_message`](Self::send_message) to send request messages,
+/// [`close_send`](Self::close_send) to signal end of the request stream,
+/// and [`recv_message`](Self::recv_message) to receive response messages.
+/// Call [`finish`](Self::finish) to get the final `(Status, trailing Metadata)`.
+pub struct StreamCall {
+    stream: crate::transport::ClientStream,
+    headers_received: bool,
+}
+
+impl StreamCall {
+    /// Encode and send one request message.
+    pub fn send_message<Req: prost::Message>(&mut self, req: &Req) -> Result<(), Status> {
+        let frame = codec::encode_message(req, None)?;
+        self.stream.send_message(frame, false)
+    }
+
+    /// Close the send side (signals END_STREAM after the last request).
+    pub fn close_send(&mut self) -> Result<(), Status> {
+        self.stream.finish_send()
+    }
+
+    /// Receive the next response message, if any.
+    ///
+    /// Automatically receives and validates initial response headers on the first call.
+    /// Returns `Ok(None)` when the server has sent all messages and is about to send trailers.
+    pub async fn recv_message<Resp: prost::Message + Default>(
+        &mut self,
+    ) -> Result<Option<Resp>, Status> {
+        if !self.headers_received {
+            self.stream.recv_headers().await?;
+            self.headers_received = true;
+        }
+        match self.stream.recv_message().await? {
+            Some(frame) => {
+                let msg = codec::decode_message(&frame, None, codec::DEFAULT_MAX_RECV_SIZE)?;
+                Ok(Some(msg))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Receive trailing metadata and the final gRPC status.
+    ///
+    /// Must be called after all messages have been received (i.e. after
+    /// `recv_message` returned `Ok(None)`).
+    pub async fn finish(&mut self) -> Result<Metadata, Status> {
+        if !self.headers_received {
+            self.stream.recv_headers().await?;
+            self.headers_received = true;
+        }
+        let (rpc_status, raw_trailers) = self.stream.recv_trailers().await?;
+        if !rpc_status.is_ok() {
+            return Err(rpc_status);
+        }
+        Ok(Metadata::from_trailer_headers(&raw_trailers))
+    }
 }
 
 // ── Tests (Modules 4 + 5 + 6) ────────────────────────────────────────────────
@@ -154,7 +248,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use crate::metadata::Metadata;
-    use crate::server::{MethodDesc, Server, ServiceDesc};
+    use crate::server::{Handler, MethodDesc, Server, ServiceDesc};
     use crate::status::Code;
 
     // ── Inline prost message definitions (no .proto file needed) ────────────
@@ -208,7 +302,7 @@ mod tests {
     async fn say_hello_end_to_end() {
         let addr = start_server(ServiceDesc {
             name: "helloworld.Greeter",
-            methods: vec![MethodDesc { name: "SayHello", handler: greeter_handler() }],
+            methods: vec![MethodDesc { name: "SayHello", handler: Handler::Unary(greeter_handler()) }],
         }).await;
 
         let channel = Channel::connect(addr).await.unwrap();
@@ -222,7 +316,7 @@ mod tests {
     async fn multiple_sequential_calls() {
         let addr = start_server(ServiceDesc {
             name: "helloworld.Greeter",
-            methods: vec![MethodDesc { name: "SayHello", handler: greeter_handler() }],
+            methods: vec![MethodDesc { name: "SayHello", handler: Handler::Unary(greeter_handler()) }],
         }).await;
 
         let channel = Channel::connect(addr).await.unwrap();
@@ -240,9 +334,9 @@ mod tests {
             name: "test.Fail",
             methods: vec![MethodDesc {
                 name: "Fail",
-                handler: Arc::new(|_: Bytes, _md: Metadata| {
+                handler: Handler::Unary(Arc::new(|_: Bytes, _md: Metadata| {
                     Box::pin(async move { Err(Status::not_found("resource missing")) })
-                }),
+                })),
             }],
         }).await;
 
@@ -259,7 +353,7 @@ mod tests {
     async fn unknown_method_via_channel() {
         let addr = start_server(ServiceDesc {
             name: "helloworld.Greeter",
-            methods: vec![MethodDesc { name: "SayHello", handler: greeter_handler() }],
+            methods: vec![MethodDesc { name: "SayHello", handler: Handler::Unary(greeter_handler()) }],
         }).await;
 
         let channel = Channel::connect(addr).await.unwrap();
@@ -280,12 +374,12 @@ mod tests {
             methods: vec![MethodDesc {
                 name: "Echo",
                 // Echo back the x-client-id metadata value as the response body
-                handler: Arc::new(|_req: Bytes, md: Metadata| {
+                handler: Handler::Unary(Arc::new(|_req: Bytes, md: Metadata| {
                     Box::pin(async move {
                         let id = md.get("x-client-id").unwrap_or("(none)").to_owned();
                         Ok(Bytes::from(id.into_bytes()))
                     })
-                }),
+                })),
             }],
         }).await;
 
@@ -327,13 +421,13 @@ mod tests {
             name: "test.Slow",
             methods: vec![MethodDesc {
                 name: "Slow",
-                handler: Arc::new(|_: Bytes, _md: Metadata| {
+                handler: Handler::Unary(Arc::new(|_: Bytes, _md: Metadata| {
                     Box::pin(async move {
                         // Sleep much longer than the client timeout.
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         Ok(Bytes::new())
                     })
-                }),
+                })),
             }],
         }).await;
 
@@ -356,7 +450,7 @@ mod tests {
 
         let addr = start_server(ServiceDesc {
             name: "helloworld.Greeter",
-            methods: vec![MethodDesc { name: "SayHello", handler: greeter_handler() }],
+            methods: vec![MethodDesc { name: "SayHello", handler: Handler::Unary(greeter_handler()) }],
         }).await;
 
         let channel = Channel::connect(addr).await.unwrap();
@@ -370,5 +464,159 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply.message, "Hello, Timeout!");
+    }
+
+    // ── Module 8: Streaming RPCs ──────────────────────────────────────────────
+
+    /// Server-streaming: client sends one request, server sends N replies.
+    #[tokio::test]
+    async fn server_streaming_multiple_responses() {
+        use crate::server::StreamingHandlerFn;
+        use crate::transport::ServerStream;
+
+        // Handler: read one request, send 3 replies, then close.
+        let handler: StreamingHandlerFn = Arc::new(|mut stream: ServerStream, _md: Metadata| {
+            Box::pin(async move {
+                // Read (and discard) the single request.
+                let _ = stream.recv_message().await;
+                stream.send_headers(&http::HeaderMap::new()).unwrap();
+                for i in 1u32..=3 {
+                    use prost::Message as _;
+                    let reply = HelloReply { message: format!("reply {i}") };
+                    let mut buf = Vec::new();
+                    reply.encode(&mut buf).unwrap();
+                    let frame = crate::codec::encode_raw(&buf, None).unwrap();
+                    stream.send_message(frame).unwrap();
+                }
+                stream.send_trailers(&Status::ok(), &http::HeaderMap::new()).ok();
+            })
+        });
+
+        let addr = start_server(ServiceDesc {
+            name: "test.Streaming",
+            methods: vec![MethodDesc {
+                name: "ServerStream",
+                handler: Handler::Streaming(handler),
+            }],
+        }).await;
+
+        let channel = Channel::connect(addr).await.unwrap();
+        let mut call = channel
+            .new_streaming_call("/test.Streaming/ServerStream", &Metadata::new(), None)
+            .unwrap();
+
+        // Send one request then close send side.
+        call.send_message(&HelloRequest { name: "go".into() }).unwrap();
+        call.close_send().unwrap();
+
+        // Collect all responses.
+        let mut replies = Vec::new();
+        while let Some(reply) = call.recv_message::<HelloReply>().await.unwrap() {
+            replies.push(reply.message.clone());
+        }
+        call.finish().await.unwrap();
+
+        assert_eq!(replies, vec!["reply 1", "reply 2", "reply 3"]);
+    }
+
+    /// Client-streaming: client sends N requests, server sends one reply.
+    #[tokio::test]
+    async fn client_streaming_accumulate_names() {
+        use crate::server::StreamingHandlerFn;
+        use crate::transport::ServerStream;
+
+        // Handler: read all requests, concatenate names, send one reply.
+        let handler: StreamingHandlerFn = Arc::new(|mut stream: ServerStream, _md: Metadata| {
+            Box::pin(async move {
+                let mut names = Vec::new();
+                while let Ok(Some(frame)) = stream.recv_message().await {
+                    use prost::Message as _;
+                    if let Ok(req) = HelloRequest::decode(&frame[5..]) {
+                        names.push(req.name);
+                    }
+                }
+                stream.send_headers(&http::HeaderMap::new()).unwrap();
+                use prost::Message as _;
+                let reply = HelloReply { message: format!("Hello, {}!", names.join(", ")) };
+                let mut buf = Vec::new();
+                reply.encode(&mut buf).unwrap();
+                let frame = crate::codec::encode_raw(&buf, None).unwrap();
+                stream.send_message(frame).unwrap();
+                stream.send_trailers(&Status::ok(), &http::HeaderMap::new()).ok();
+            })
+        });
+
+        let addr = start_server(ServiceDesc {
+            name: "test.ClientStream",
+            methods: vec![MethodDesc {
+                name: "Accumulate",
+                handler: Handler::Streaming(handler),
+            }],
+        }).await;
+
+        let channel = Channel::connect(addr).await.unwrap();
+        let mut call = channel
+            .new_streaming_call("/test.ClientStream/Accumulate", &Metadata::new(), None)
+            .unwrap();
+
+        for name in &["Alice", "Bob", "Carol"] {
+            call.send_message(&HelloRequest { name: name.to_string() }).unwrap();
+        }
+        call.close_send().unwrap();
+
+        let reply: HelloReply = call.recv_message().await.unwrap().unwrap();
+        call.finish().await.unwrap();
+
+        assert_eq!(reply.message, "Hello, Alice, Bob, Carol!");
+    }
+
+    /// Bidirectional streaming: echo each message back.
+    #[tokio::test]
+    async fn bidi_streaming_echo() {
+        use crate::server::StreamingHandlerFn;
+        use crate::transport::ServerStream;
+
+        let handler: StreamingHandlerFn = Arc::new(|mut stream: ServerStream, _md: Metadata| {
+            Box::pin(async move {
+                stream.send_headers(&http::HeaderMap::new()).unwrap();
+                while let Ok(Some(frame)) = stream.recv_message().await {
+                    use prost::Message as _;
+                    if let Ok(req) = HelloRequest::decode(&frame[5..]) {
+                        let reply = HelloReply { message: format!("echo: {}", req.name) };
+                        let mut buf = Vec::new();
+                        reply.encode(&mut buf).unwrap();
+                        let resp_frame = crate::codec::encode_raw(&buf, None).unwrap();
+                        if stream.send_message(resp_frame).is_err() {
+                            break;
+                        }
+                    }
+                }
+                stream.send_trailers(&Status::ok(), &http::HeaderMap::new()).ok();
+            })
+        });
+
+        let addr = start_server(ServiceDesc {
+            name: "test.Bidi",
+            methods: vec![MethodDesc {
+                name: "Echo",
+                handler: Handler::Streaming(handler),
+            }],
+        }).await;
+
+        let channel = Channel::connect(addr).await.unwrap();
+        let mut call = channel
+            .new_streaming_call("/test.Bidi/Echo", &Metadata::new(), None)
+            .unwrap();
+
+        for name in &["X", "Y", "Z"] {
+            call.send_message(&HelloRequest { name: name.to_string() }).unwrap();
+            let reply: HelloReply = call.recv_message().await.unwrap().unwrap();
+            assert_eq!(reply.message, format!("echo: {name}"));
+        }
+        call.close_send().unwrap();
+
+        // After close_send, server should exit its loop and send trailers.
+        assert!(call.recv_message::<HelloReply>().await.unwrap().is_none());
+        call.finish().await.unwrap();
     }
 }
