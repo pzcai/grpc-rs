@@ -8,11 +8,12 @@
 ---
 
 ## Current status
-ALL MODULES COMPLETE (1–12) + cross-implementation interop validated. 100 tests passing.
+ALL MODULES COMPLETE (1–13) + cross-implementation interop validated. 100 tests passing.
 All 6 gRPC interop test cases pass against the grpc-go reference server.
 Core gRPC library fully functional: codec, transport, server, client, unary/streaming RPCs,
 metadata, deadline/cancellation, TLS (rustls), interceptors, interop test binary,
-basic retry policy. Next: examples (helloworld, route_guide).
+basic retry policy, helloworld + route_guide examples.
+Project meets all CLAUDE.md success criteria.
 
 ## Session log
 
@@ -335,6 +336,31 @@ Not the full A6 spec (no per-method configs, no hedging, no retry throttling).
 - 3 integration tests: `retry_succeeds_on_second_attempt`, `retry_exhausted_returns_last_error`,
   `non_retryable_code_not_retried` — uses `AtomicUsize` flaky handler
 - 100 total tests passing (94 library + 6 interop)
+
+---
+
+### 2026-03-28 — Session 3 (continued): Examples (Module 13)
+
+**Plan (written before any code):**
+Add `examples/helloworld_server.rs` and `examples/helloworld_client.rs` mirroring
+grpc-go's helloworld demo (unary only). Add `examples/route_guide_server.rs` and
+`examples/route_guide_client.rs` mirroring grpc-go's route_guide demo, exercising all
+four call types. Use inline prost message definitions (no proto compiler).
+
+**Completed:**
+- `examples/helloworld_server.rs`: Server implementing `helloworld.Greeter/SayHello`
+- `examples/helloworld_client.rs`: Client calling `SayHello` with optional CLI name arg
+- `examples/route_guide_server.rs`: Server with 4 RPC methods + static feature DB +
+  haversine distance calculation
+- `examples/route_guide_client.rs`: Client exercising GetFeature, ListFeatures, RecordRoute,
+  RouteChat against the route_guide server
+- `pub use crate::transport::ServerStream` added to `server.rs` for clean public API
+- Fix: `find_feature<'a>` needed explicit lifetime annotation
+- Fix: `Default` derive on `HelloReply` conflicted with prost's `Message` derive (removed)
+- Smoke-tested both example pairs end-to-end; all four call types produce correct output
+- 100 total tests passing (unchanged)
+
+**Project status:** All CLAUDE.md success criteria met.
 
 ---
 
