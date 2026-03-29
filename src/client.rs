@@ -266,7 +266,8 @@ impl Channel {
                 .map_err(|_| Status::internal("channel transport mutex poisoned"))?;
             guard.new_stream(method, &header_map)?
         };
-        Ok(StreamCall { stream, headers_received: false })
+        let deadline = timeout.map(|d| std::time::Instant::now() + d);
+        Ok(StreamCall { stream, headers_received: false, deadline })
     }
 }
 
@@ -281,6 +282,8 @@ impl Channel {
 pub struct StreamCall {
     stream: crate::transport::ClientStream,
     headers_received: bool,
+    /// Absolute deadline for all receive operations on this stream.
+    deadline: Option<std::time::Instant>,
 }
 
 impl StreamCall {
@@ -295,24 +298,37 @@ impl StreamCall {
         self.stream.finish_send()
     }
 
+    /// Cancel the call by sending RST_STREAM(CANCEL).
+    ///
+    /// After this, [`recv_message`](Self::recv_message) and [`finish`](Self::finish)
+    /// will return `Status::cancelled`.
+    pub fn cancel(&mut self) {
+        self.stream.cancel();
+    }
+
     /// Receive the next response message, if any.
     ///
     /// Automatically receives and validates initial response headers on the first call.
     /// Returns `Ok(None)` when the server has sent all messages and is about to send trailers.
+    /// Returns `Err(Status::deadline_exceeded(...))` if the call deadline fires.
     pub async fn recv_message<Resp: prost::Message + Default>(
         &mut self,
     ) -> Result<Option<Resp>, Status> {
-        if !self.headers_received {
-            self.stream.recv_headers().await?;
-            self.headers_received = true;
-        }
-        match self.stream.recv_message().await? {
-            Some(frame) => {
-                let msg = codec::decode_message(&frame, None, codec::DEFAULT_MAX_RECV_SIZE)?;
-                Ok(Some(msg))
+        let deadline = self.deadline;
+        let inner = async {
+            if !self.headers_received {
+                self.stream.recv_headers().await?;
+                self.headers_received = true;
             }
-            None => Ok(None),
-        }
+            match self.stream.recv_message().await? {
+                Some(frame) => {
+                    let msg = codec::decode_message(&frame, None, codec::DEFAULT_MAX_RECV_SIZE)?;
+                    Ok(Some(msg))
+                }
+                None => Ok(None),
+            }
+        };
+        apply_deadline(deadline, inner).await
     }
 
     /// Receive trailing metadata and the final gRPC status.
@@ -320,15 +336,53 @@ impl StreamCall {
     /// Must be called after all messages have been received (i.e. after
     /// `recv_message` returned `Ok(None)`).
     pub async fn finish(&mut self) -> Result<Metadata, Status> {
-        if !self.headers_received {
-            self.stream.recv_headers().await?;
-            self.headers_received = true;
+        let deadline = self.deadline;
+        let inner = async {
+            if !self.headers_received {
+                self.stream.recv_headers().await?;
+                self.headers_received = true;
+            }
+            let (rpc_status, raw_trailers) = self.stream.recv_trailers().await?;
+            if !rpc_status.is_ok() {
+                return Err(rpc_status);
+            }
+            Ok(Metadata::from_trailer_headers(&raw_trailers))
+        };
+        apply_deadline(deadline, inner).await
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Run `fut`, aborting with `DeadlineExceeded` if the absolute `deadline` fires first.
+///
+/// Also converts `CANCELLED` → `DEADLINE_EXCEEDED` when the deadline has passed:
+/// the server may cancel the stream (RST_STREAM CANCEL) before our local timer fires,
+/// but from the caller's perspective the cause is a deadline expiry.
+async fn apply_deadline<T>(
+    deadline: Option<std::time::Instant>,
+    fut: impl std::future::Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    use crate::status::Code;
+    if let Some(dl) = deadline {
+        let remaining = dl
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or(Duration::ZERO);
+        let result = match tokio::time::timeout(remaining, fut).await {
+            Ok(result) => result,
+            Err(_) => return Err(Status::deadline_exceeded("streaming RPC deadline exceeded")),
+        };
+        // If the deadline has now elapsed and we received CANCELLED, translate to
+        // DEADLINE_EXCEEDED.  This handles the race where the server sends
+        // RST_STREAM(CANCEL) due to grpc-timeout expiry before our local timer fires.
+        if let Err(ref e) = result {
+            if e.code == Code::Cancelled && std::time::Instant::now() >= dl {
+                return Err(Status::deadline_exceeded("streaming RPC deadline exceeded"));
+            }
         }
-        let (rpc_status, raw_trailers) = self.stream.recv_trailers().await?;
-        if !rpc_status.is_ok() {
-            return Err(rpc_status);
-        }
-        Ok(Metadata::from_trailer_headers(&raw_trailers))
+        result
+    } else {
+        fut.await
     }
 }
 

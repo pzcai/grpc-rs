@@ -86,6 +86,32 @@ impl Status {
     }
 }
 
+impl TryFrom<u32> for Code {
+    type Error = ();
+    fn try_from(n: u32) -> Result<Self, ()> {
+        Ok(match n {
+            0  => Code::Ok,
+            1  => Code::Cancelled,
+            2  => Code::Unknown,
+            3  => Code::InvalidArgument,
+            4  => Code::DeadlineExceeded,
+            5  => Code::NotFound,
+            6  => Code::AlreadyExists,
+            7  => Code::PermissionDenied,
+            8  => Code::ResourceExhausted,
+            9  => Code::FailedPrecondition,
+            10 => Code::Aborted,
+            11 => Code::OutOfRange,
+            12 => Code::Unimplemented,
+            13 => Code::Internal,
+            14 => Code::Unavailable,
+            15 => Code::DataLoss,
+            16 => Code::Unauthenticated,
+            _  => return Err(()),
+        })
+    }
+}
+
 impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "rpc error: code = {:?} desc = {}", self.code, self.message)

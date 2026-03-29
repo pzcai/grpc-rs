@@ -134,6 +134,13 @@ impl ClientStream {
             .map_err(|e| Status::internal(format!("finish_send: {e}")))
     }
 
+    /// Cancel the stream by sending RST_STREAM(CANCEL).
+    ///
+    /// After this call, further recv operations return `Status::cancelled`.
+    pub fn cancel(&mut self) {
+        self.send.send_reset(h2::Reason::CANCEL);
+    }
+
     /// Wait for and return the initial response headers from the server.
     ///
     /// Must be called before [`recv_message`] or [`recv_trailers`].
@@ -142,7 +149,7 @@ impl ClientStream {
         if let Some(fut) = self.response_fut.take() {
             let response = fut
                 .await
-                .map_err(|e| Status::internal(format!("await response headers: {e}")))?;
+                .map_err(|e| h2_error_to_status(e))?;
 
             // Validate :status and content-type
             if response.status() != 200 {
@@ -219,7 +226,7 @@ impl ClientStream {
                         .release_capacity(n)
                         .map_err(|e| Status::internal(format!("release_capacity: {e}")))?;
                 }
-                Some(Err(e)) => return Err(Status::internal(format!("recv data frame: {e}"))),
+                Some(Err(e)) => return Err(h2_error_to_status(e)),
                 None => {
                     self.recv_done = true;
                 }
@@ -256,7 +263,7 @@ impl ClientStream {
                         .map_err(|e| Status::internal(format!("drain release_capacity: {e}")))?;
                 }
                 Some(Err(e)) => {
-                    return Err(Status::internal(format!("drain data: {e}")));
+                    return Err(h2_error_to_status(e));
                 }
                 None => {
                     self.recv_done = true;
@@ -267,7 +274,7 @@ impl ClientStream {
         let trailers = recv
             .trailers()
             .await
-            .map_err(|e| Status::internal(format!("recv trailers: {e}")))?
+            .map_err(|e| h2_error_to_status(e))?
             .unwrap_or_default();
 
         let status = parse_grpc_status(&trailers)?;
@@ -276,6 +283,22 @@ impl ClientStream {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Translate an h2 protocol error to a gRPC Status.
+///
+/// RST_STREAM(CANCEL) from the peer (or sent locally) maps to CANCELLED.
+/// RST_STREAM(REFUSED_STREAM) maps to UNAVAILABLE (retryable).
+/// Everything else maps to INTERNAL.
+fn h2_error_to_status(e: h2::Error) -> Status {
+    if e.is_reset() {
+        match e.reason() {
+            Some(h2::Reason::CANCEL) => return Status::cancelled("stream cancelled"),
+            Some(h2::Reason::REFUSED_STREAM) => return Status::unavailable("stream refused"),
+            _ => {}
+        }
+    }
+    Status::internal(format!("h2 error: {e}"))
+}
 
 /// Parse `grpc-status` (and optionally `grpc-message`) from a trailer `HeaderMap`.
 fn parse_grpc_status(trailers: &HeaderMap) -> Result<Status, Status> {
