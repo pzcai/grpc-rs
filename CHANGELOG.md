@@ -8,8 +8,7 @@
 ---
 
 ## Current status
-ALL MODULES COMPLETE (1–13) + cross-implementation interop validated. 100 tests passing.
-All 6 gRPC interop test cases pass against the grpc-go reference server.
+ALL 14 gRPC INTEROP TEST CASES PASS against grpc-go reference server. 108 tests passing.
 Core gRPC library fully functional: codec, transport, server, client, unary/streaming RPCs,
 metadata, deadline/cancellation, TLS (rustls), interceptors, interop test binary,
 basic retry policy, helloworld + route_guide examples.
@@ -361,6 +360,43 @@ four call types. Use inline prost message definitions (no proto compiler).
 - 100 total tests passing (unchanged)
 
 **Project status:** All CLAUDE.md success criteria met.
+
+---
+
+### 2026-03-28 — Session 3 (continued): Complete interop test suite (14 test cases)
+
+**Plan (written before any code):**
+Add 8 remaining interop test cases to cover the full non-auth gRPC interop spec:
+status_code_and_message, special_status_message, unimplemented_method,
+unimplemented_service, cancel_after_begin, cancel_after_first_response,
+timeout_on_sleeping_server, custom_metadata.
+Required infrastructure: stream cancellation, streaming deadline enforcement,
+metadata echo in server responses.
+
+**Completed:**
+
+Infrastructure:
+- `ClientStream::cancel()`: sends RST_STREAM(CANCEL) via `h2::SendStream::send_reset`
+- `h2_error_to_status()`: RST_STREAM(CANCEL) → Cancelled; REFUSED_STREAM → Unavailable
+- `StreamCall.deadline: Option<Instant>`: set from `timeout` in `new_streaming_call`
+- `apply_deadline()` free function: wraps future in `tokio::time::timeout`; also converts
+  CANCELLED → DEADLINE_EXCEEDED when deadline has elapsed (handles race where grpc-go
+  sends RST_STREAM(CANCEL) due to `grpc-timeout` expiry before our local timer fires)
+- `Code: TryFrom<u32>`: needed to convert EchoStatus.code from protobuf to gRPC status code
+
+Server changes:
+- `UnaryCall` handler changed to `Handler::Streaming` to support echoing metadata in
+  initial response headers AND trailing headers (required for custom_metadata test)
+- `interval_us` delay in `StreamingOutputCall` and `FullDuplexCall` handlers
+- `SimpleRequest`: added `EchoStatus` message type and `response_status` field (tag 7)
+
+Failures found and fixed during cross-implementation testing:
+- `timeout_on_sleeping_server`: initially got CANCELLED instead of DEADLINE_EXCEEDED
+  because grpc-go sends RST_STREAM(CANCEL) when `grpc-timeout` expires on server side.
+  Fixed by checking deadline expiry after CANCELLED in `apply_deadline`.
+
+**Outcome:** All 14 interop test cases PASS against grpc-go reference server.
+108 total tests passing (94 library + 14 interop).
 
 ---
 
