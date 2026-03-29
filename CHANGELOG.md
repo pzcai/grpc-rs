@@ -8,10 +8,11 @@
 ---
 
 ## Current status
-ALL MODULES COMPLETE (1–11) + cross-implementation interop validated. 94 tests passing.
+ALL MODULES COMPLETE (1–12) + cross-implementation interop validated. 100 tests passing.
 All 6 gRPC interop test cases pass against the grpc-go reference server.
 Core gRPC library fully functional: codec, transport, server, client, unary/streaming RPCs,
-metadata, deadline/cancellation, TLS (rustls), interceptors, interop test binary.
+metadata, deadline/cancellation, TLS (rustls), interceptors, interop test binary,
+basic retry policy. Next: examples (helloworld, route_guide).
 
 ## Session log
 
@@ -313,6 +314,27 @@ returned `None`, then `parse_grpc_status` failed on an empty `HeaderMap`.
 **Outcome:** All 6 interop test cases PASS against grpc-go reference server:
   empty_unary, large_unary, client_streaming, server_streaming, ping_pong, empty_stream.
 94 tests passing (unchanged).
+
+---
+
+### 2026-03-28 — Session 3 (continued): Basic retry policy (Module 12)
+
+**Plan (written before any code):**
+Add `RetryPolicy` in `src/retry.rs`: `max_attempts`, `initial_backoff`, `max_backoff`,
+`backoff_multiplier`, `retryable_codes`. Wire into `Channel` via `with_retry_policy()`
+builder. `call_unary` loops up to `max_attempts`, sleeps exponential backoff between
+attempts, stops immediately on non-retryable codes, respects the outer `timeout`.
+Not the full A6 spec (no per-method configs, no hedging, no retry throttling).
+
+**Completed:**
+- `src/retry.rs`: `RetryPolicy` struct, `is_retryable()`, `backoff_for_attempt()`
+- `Channel::with_retry_policy(RetryPolicy) -> Self` builder (consumes, returns modified Channel)
+- `call_unary` retry loop: inner async block runs up to `max_attempts` with backoff sleep;
+  outer `tokio::time::timeout` wraps entire loop
+- 3 unit tests in `retry.rs` (backoff math, retryable code check)
+- 3 integration tests: `retry_succeeds_on_second_attempt`, `retry_exhausted_returns_last_error`,
+  `non_retryable_code_not_retried` — uses `AtomicUsize` flaky handler
+- 100 total tests passing (94 library + 6 interop)
 
 ---
 

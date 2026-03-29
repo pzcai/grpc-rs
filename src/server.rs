@@ -33,7 +33,10 @@ use crate::interceptor::{self, UnaryServerInterceptor};
 use crate::metadata::Metadata;
 use crate::status::Status;
 use crate::tls;
-use crate::transport::{self, ServerStream, ServerTransport};
+use crate::transport::{self, ServerTransport};
+
+// Re-export ServerStream so callers can use it without depending on the transport module directly.
+pub use crate::transport::ServerStream;
 
 // ── Handler types ─────────────────────────────────────────────────────────────
 
