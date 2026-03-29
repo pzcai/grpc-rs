@@ -8,8 +8,8 @@
 //!
 //! Optionally pass a name:
 //!   cargo run --example helloworld_client -- World
-
-use std::net::SocketAddr;
+//!
+//! Set RUST_LOG=debug to see gRPC traces.
 
 use prost::Message;
 
@@ -34,10 +34,13 @@ struct HelloReply {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     let name = std::env::args().nth(1).unwrap_or_else(|| "World".to_string());
 
-    let addr: SocketAddr = "127.0.0.1:50051".parse().unwrap();
-    let channel = Channel::connect(addr)
+    let channel = Channel::connect("127.0.0.1:50051")
         .await
         .expect("failed to connect to server");
 

@@ -5,16 +5,12 @@
 //!
 //! Run with:
 //!   cargo run --example helloworld_server
+//!
+//! Set RUST_LOG=debug to see gRPC traces.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-
-use bytes::Bytes;
 use prost::Message;
 
-use grpc_rs::metadata::Metadata;
-use grpc_rs::server::{BoxFuture, Handler, MethodDesc, Server, ServiceDesc, UnaryHandlerFn};
-use grpc_rs::status::Status;
+use grpc_rs::server::{unary_handler, Handler, MethodDesc, Server, ServiceDesc};
 
 // ── Protobuf message definitions (mirrors helloworld.proto) ──────────────────
 
@@ -30,43 +26,32 @@ struct HelloReply {
     message: String,
 }
 
-// ── Service implementation ────────────────────────────────────────────────────
-
-fn say_hello_handler() -> UnaryHandlerFn {
-    Arc::new(|req_bytes: Bytes, _md: Metadata| -> BoxFuture<Result<Bytes, Status>> {
-        Box::pin(async move {
-            let req = HelloRequest::decode(req_bytes.as_ref())
-                .map_err(|e| Status::internal(format!("decode request: {e}")))?;
-
-            println!("Received: name = {:?}", req.name);
-
-            let reply = HelloReply {
-                message: format!("Hello, {}!", req.name),
-            };
-            let mut buf = Vec::new();
-            reply
-                .encode(&mut buf)
-                .map_err(|e| Status::internal(format!("encode reply: {e}")))?;
-            Ok(Bytes::from(buf))
-        })
-    })
-}
-
 // ── main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
-    let addr: SocketAddr = "0.0.0.0:50051".parse().unwrap();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     let mut server = Server::new();
     server.add_service(ServiceDesc {
         name: "helloworld.Greeter",
         methods: vec![MethodDesc {
             name: "SayHello",
-            handler: Handler::Unary(say_hello_handler()),
+            handler: Handler::Unary(unary_handler(|req: HelloRequest, _md| async move {
+                tracing::info!(name = %req.name, "SayHello");
+                Ok(HelloReply {
+                    message: format!("Hello, {}!", req.name),
+                })
+            })),
         }],
     });
 
+    let addr = "0.0.0.0:50051";
     println!("gRPC server listening on {addr}");
-    server.serve(addr).await.expect("server failed");
+    server
+        .serve(addr.parse().unwrap())
+        .await
+        .expect("server failed");
 }

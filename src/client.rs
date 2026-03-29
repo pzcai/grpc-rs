@@ -10,11 +10,11 @@
 //! This is a minimal Channel implementation (no reconnection, no name resolution,
 //! no load balancing).  These features are deferred until a later session.
 
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::TcpStream;
+use tracing::Instrument;
 
 use crate::codec;
 use crate::interceptor::{self, UnaryClientInterceptor};
@@ -26,8 +26,9 @@ use crate::transport::{self, ClientTransport};
 
 /// A gRPC channel: a logical connection to a single server endpoint.
 ///
-/// Cheaply cloneable in the future (when backed by a connection pool); for now
-/// it holds one HTTP/2 connection.
+/// `Channel` is cheap to clone — all clones share the same underlying HTTP/2
+/// connection.
+#[derive(Clone)]
 pub struct Channel {
     transport: Arc<Mutex<ClientTransport>>,
     interceptors: Vec<UnaryClientInterceptor>,
@@ -35,13 +36,16 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Connect to a gRPC server at `addr` over plain TCP (no TLS).
+    /// Connect to a gRPC server over plain TCP (no TLS).
+    ///
+    /// `addr` accepts anything that resolves to a socket address:
+    /// a `SocketAddr`, a `(host, port)` tuple, or a `"host:port"` string.
     ///
     /// The HTTP/2 connection task is spawned internally.
-    pub async fn connect(addr: SocketAddr) -> Result<Self, Status> {
+    pub async fn connect(addr: impl tokio::net::ToSocketAddrs) -> Result<Self, Status> {
         let tcp = TcpStream::connect(addr)
             .await
-            .map_err(|e| Status::unavailable(format!("connect {addr}: {e}")))?;
+            .map_err(|e| Status::unavailable(format!("TCP connect: {e}")))?;
 
         let (transport, conn_fut) = ClientTransport::connect(tcp).await?;
         tokio::spawn(conn_fut);
@@ -59,13 +63,13 @@ impl Channel {
     /// - `tls_cfg`: a rustls `ClientConfig`; ALPN `h2` must be included
     ///   (use [`crate::tls::client_config_from_roots`] to build one).
     pub async fn connect_tls(
-        addr: SocketAddr,
+        addr: impl tokio::net::ToSocketAddrs,
         server_name: tls::TlsServerName<'static>,
         tls_cfg: tls::ClientConfig,
     ) -> Result<Self, Status> {
         let tcp = TcpStream::connect(addr)
             .await
-            .map_err(|e| Status::unavailable(format!("connect {addr}: {e}")))?;
+            .map_err(|e| Status::unavailable(format!("TCP connect: {e}")))?;
 
         let connector = tls::connector(tls_cfg);
         let tls_stream = connector
@@ -118,6 +122,8 @@ impl Channel {
         Req: prost::Message,
         Resp: prost::Message + Default,
     {
+        let span = tracing::debug_span!("grpc.client", method = %method);
+
         let inner_fut = async {
             let max_attempts = self
                 .retry_policy
@@ -128,7 +134,6 @@ impl Channel {
             let mut last_err = Status::internal("no attempts made");
 
             for attempt in 0..max_attempts {
-                // Exponential backoff before every attempt after the first.
                 if attempt > 0 {
                     let backoff = self
                         .retry_policy
@@ -136,29 +141,34 @@ impl Channel {
                         .map(|p| p.backoff_for_attempt(attempt))
                         .unwrap_or(Duration::ZERO);
                     if !backoff.is_zero() {
+                        tracing::debug!(attempt, "retrying after backoff");
                         tokio::time::sleep(backoff).await;
                     }
                 }
 
                 match self.call_unary_inner(method, req, metadata, timeout).await {
-                    Ok(r) => return Ok(r),
+                    Ok(r) => {
+                        tracing::debug!("rpc ok");
+                        return Ok(r);
+                    }
                     Err(e) => {
                         let retryable = self
                             .retry_policy
                             .as_ref()
                             .map(|p| p.is_retryable(e.code))
                             .unwrap_or(false);
+                        tracing::warn!(code = ?e.code, message = %e.message, retryable, "rpc error");
                         last_err = e;
                         if !retryable {
                             break;
                         }
-                        // retryable: continue to next attempt
                     }
                 }
             }
 
             Err(last_err)
-        };
+        }
+        .instrument(span);
 
         match timeout {
             Some(d) => match tokio::time::timeout(d, inner_fut).await {
@@ -391,6 +401,7 @@ async fn apply_deadline<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
     use std::sync::Arc;
 
     use bytes::Bytes;

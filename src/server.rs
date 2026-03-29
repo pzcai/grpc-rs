@@ -27,6 +27,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http::HeaderMap;
 use tokio::net::TcpListener;
+use tracing::Instrument;
 
 use crate::codec;
 use crate::interceptor::{self, UnaryServerInterceptor};
@@ -61,6 +62,45 @@ pub type UnaryHandlerFn =
 /// `send_headers`, `send_message`, and `send_trailers` on the stream itself.
 pub type StreamingHandlerFn =
     Arc<dyn Fn(ServerStream, Metadata) -> BoxFuture<()> + Send + Sync + 'static>;
+
+/// Build a [`UnaryHandlerFn`] from a typed async closure.
+///
+/// Handles protobuf decode/encode automatically, so the closure works with
+/// concrete message types instead of raw `Bytes`:
+///
+/// ```ignore
+/// use grpc_rs::server::unary_handler;
+///
+/// let handler = unary_handler(|req: HelloRequest, _md| async move {
+///     Ok(HelloReply { message: format!("Hello, {}!", req.name) })
+/// });
+/// ```
+pub fn unary_handler<Req, Resp, F, Fut>(f: F) -> UnaryHandlerFn
+where
+    Req: prost::Message + Default + 'static,
+    Resp: prost::Message + 'static,
+    F: Fn(Req, Metadata) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<Resp, Status>> + Send + 'static,
+{
+    Arc::new(move |req_bytes: Bytes, md: Metadata| {
+        let req = match Req::decode(req_bytes.as_ref()) {
+            Ok(r) => r,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(Status::internal(
+                    format!("decode request: {e}"),
+                )))) as BoxFuture<_>;
+            }
+        };
+        let fut = f(req, md);
+        Box::pin(async move {
+            let resp = fut.await?;
+            let mut buf = Vec::new();
+            resp.encode(&mut buf)
+                .map_err(|e| Status::internal(format!("encode response: {e}")))?;
+            Ok(Bytes::from(buf))
+        }) as BoxFuture<_>
+    })
+}
 
 /// Discriminates between unary and streaming method handlers.
 pub enum Handler {
@@ -164,7 +204,9 @@ impl Server {
                 while let Some(stream) = transport.accept().await {
                     let services = Arc::clone(&services);
                     let interceptors = Arc::clone(&interceptors);
-                    tokio::spawn(dispatch_stream(stream, services, interceptors));
+                    let method = stream.method().to_owned();
+                    let span = tracing::info_span!("grpc.server", method = %method);
+                    tokio::spawn(dispatch_stream(stream, services, interceptors).instrument(span));
                 }
             });
         }
@@ -204,7 +246,9 @@ impl Server {
                 while let Some(stream) = transport.accept().await {
                     let services = Arc::clone(&services);
                     let interceptors = Arc::clone(&interceptors);
-                    tokio::spawn(dispatch_stream(stream, services, interceptors));
+                    let method = stream.method().to_owned();
+                    let span = tracing::info_span!("grpc.server", method = %method);
+                    tokio::spawn(dispatch_stream(stream, services, interceptors).instrument(span));
                 }
             });
         }
@@ -350,8 +394,12 @@ async fn dispatch_unary(
         chain(payload, request_metadata).await
     };
     let response_payload = match handler_result {
-        Ok(b) => b,
+        Ok(b) => {
+            tracing::debug!("rpc ok");
+            b
+        }
         Err(e) => {
+            tracing::warn!(code = ?e.code, message = %e.message, "rpc error");
             send_error(&mut stream, e);
             return;
         }
