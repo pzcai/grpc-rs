@@ -88,6 +88,7 @@ impl ClientTransport {
             recv: None,
             buf: BytesMut::new(),
             recv_done: false,
+            trailer_only_headers: None,
         })
     }
 }
@@ -105,6 +106,8 @@ pub struct ClientStream {
     buf: BytesMut,
     /// Set when all DATA frames from the server have been consumed.
     recv_done: bool,
+    /// Cached trailers for trailer-only responses (grpc-status in initial HEADERS).
+    trailer_only_headers: Option<HeaderMap>,
 }
 
 impl ClientStream {
@@ -162,6 +165,14 @@ impl ClientStream {
                         ct.to_str().unwrap_or("<non-utf8>")
                     )));
                 }
+            }
+
+            // Detect trailer-only response: grpc-status in the initial HEADERS frame.
+            // In this case the server sent a single HEADERS frame with END_STREAM; there
+            // will be no DATA frames and no separate TRAILERS frame.
+            if parts.headers.contains_key("grpc-status") {
+                self.recv_done = true;
+                self.trailer_only_headers = Some(parts.headers.clone());
             }
 
             self.recv = Some(body);
@@ -224,6 +235,12 @@ impl ClientStream {
     /// Returns `(Status, extra_trailer_headers)`.
     /// `recv_headers` must have been called first.
     pub async fn recv_trailers(&mut self) -> Result<(Status, HeaderMap), Status> {
+        // For trailer-only responses the grpc-status arrived in the initial HEADERS frame.
+        if let Some(headers) = self.trailer_only_headers.take() {
+            let status = parse_grpc_status(&headers)?;
+            return Ok((status, headers));
+        }
+
         let recv = self
             .recv
             .as_mut()

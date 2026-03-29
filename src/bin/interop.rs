@@ -386,10 +386,12 @@ async fn main() {
         let server = make_server();
         server.serve(addr).await.expect("serve failed");
     } else {
-        // Client mode
-        let addr: SocketAddr = format!("{}:{}", args.server_host, args.server_port)
-            .parse()
-            .unwrap();
+        // Client mode — resolve hostname to support both IPs and DNS names
+        let addr = tokio::net::lookup_host(format!("{}:{}", args.server_host, args.server_port))
+            .await
+            .expect("DNS lookup failed")
+            .next()
+            .expect("no addresses resolved");
         let channel = Channel::connect(addr).await.expect("connect failed");
 
         match args.test_case.as_str() {

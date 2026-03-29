@@ -8,9 +8,10 @@
 ---
 
 ## Current status
-ALL MODULES COMPLETE (1–11). 94 tests passing. Core gRPC library fully functional:
-codec, transport, server, client, unary/streaming RPCs, metadata, deadline/cancellation,
-TLS (rustls), interceptors, interop test binary. Next: run against grpc-go reference server.
+ALL MODULES COMPLETE (1–11) + cross-implementation interop validated. 94 tests passing.
+All 6 gRPC interop test cases pass against the grpc-go reference server.
+Core gRPC library fully functional: codec, transport, server, client, unary/streaming RPCs,
+metadata, deadline/cancellation, TLS (rustls), interceptors, interop test binary.
 
 ## Session log
 
@@ -278,6 +279,40 @@ a running grpc-go reference server.
 **Next:** Run the interop binary against a live grpc-go reference server to validate
 cross-implementation compatibility. Command:
   `cargo run --bin interop -- --mode=client --server_host=localhost --server_port=10000 --test_case=all`
+
+---
+
+### 2026-03-28 — Session 3: Cross-implementation interop validation
+
+**Plan (written before any code):**
+Run the grpc-go reference interop server (built in Session 2) and execute all 6 interop
+test cases from the Rust client against it. Fix any failures found.
+
+**Results:**
+5/6 test cases passed immediately. `empty_stream` failed with:
+  "missing grpc-status header in trailers"
+
+**Root cause:**
+`empty_stream` sends no messages and calls `FullDuplexCall` then immediately half-closes.
+The grpc-go server responds with a "trailer-only" HTTP/2 response: a single HEADERS frame
+with `END_STREAM=true` that contains both `:status: 200` and `grpc-status: 0`. There is
+no separate TRAILERS frame. Our `recv_trailers()` called `RecvStream::trailers()` which
+returned `None`, then `parse_grpc_status` failed on an empty `HeaderMap`.
+
+**Fix:**
+- Added `trailer_only_headers: Option<HeaderMap>` field to `ClientStream`
+- In `recv_headers()`: if initial response headers contain `grpc-status`, cache them as
+  `trailer_only_headers` and set `recv_done = true`
+- In `recv_trailers()`: if `trailer_only_headers` is populated, return it immediately
+  without calling `recv.trailers()`
+
+**Other fix:**
+- `interop.rs` main used `SocketAddr::parse()` for `--server_host=localhost`, which fails
+  for DNS names. Replaced with `tokio::net::lookup_host().next()`.
+
+**Outcome:** All 6 interop test cases PASS against grpc-go reference server:
+  empty_unary, large_unary, client_streaming, server_streaming, ping_pong, empty_stream.
+94 tests passing (unchanged).
 
 ---
 
