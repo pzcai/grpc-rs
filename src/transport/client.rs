@@ -37,7 +37,10 @@ impl ClientTransport {
     pub async fn connect<T: AsyncRead + AsyncWrite + Unpin>(
         io: T,
     ) -> Result<(Self, impl std::future::Future<Output = ()>), Status> {
-        let (sender, conn) = h2::client::handshake(io)
+        let (sender, conn) = h2::client::Builder::new()
+            .initial_window_size(4 * 1024 * 1024)
+            .initial_connection_window_size(4 * 1024 * 1024)
+            .handshake(io)
             .await
             .map_err(|e| Status::internal(format!("HTTP/2 client handshake: {e}")))?;
 

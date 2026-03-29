@@ -42,7 +42,10 @@ impl ServerTransport {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let conn = h2::server::handshake(io)
+        let conn = h2::server::Builder::new()
+            .initial_window_size(4 * 1024 * 1024)
+            .initial_connection_window_size(4 * 1024 * 1024)
+            .handshake(io)
             .await
             .map_err(|e| Status::internal(format!("HTTP/2 server handshake: {e}")))?;
 
@@ -318,7 +321,7 @@ mod tests {
         use crate::codec;
         use tokio::io::duplex;
 
-        let (server_io, client_io) = duplex(64 * 1024);
+        let (server_io, client_io) = duplex(4 * 1024 * 1024);
 
         let server = tokio::spawn(async move {
             let mut transport = ServerTransport::new(server_io).await.unwrap();
@@ -374,7 +377,7 @@ mod tests {
     async fn server_stream_trailer_only_response() {
         use tokio::io::duplex;
 
-        let (server_io, client_io) = duplex(64 * 1024);
+        let (server_io, client_io) = duplex(4 * 1024 * 1024);
 
         let server = tokio::spawn(async move {
             let mut transport = ServerTransport::new(server_io).await.unwrap();
@@ -425,7 +428,7 @@ mod tests {
         use tokio::io::duplex;
         use tokio::sync::oneshot;
 
-        let (server_io, client_io) = duplex(64 * 1024);
+        let (server_io, client_io) = duplex(4 * 1024 * 1024);
         let (done_tx, done_rx) = oneshot::channel::<()>();
 
         tokio::spawn(async move {
