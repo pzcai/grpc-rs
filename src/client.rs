@@ -19,6 +19,7 @@ use tokio::net::TcpStream;
 use crate::codec;
 use crate::interceptor::{self, UnaryClientInterceptor};
 use crate::metadata::Metadata;
+use crate::retry::RetryPolicy;
 use crate::status::Status;
 use crate::tls;
 use crate::transport::{self, ClientTransport};
@@ -30,6 +31,7 @@ use crate::transport::{self, ClientTransport};
 pub struct Channel {
     transport: Arc<Mutex<ClientTransport>>,
     interceptors: Vec<UnaryClientInterceptor>,
+    retry_policy: Option<RetryPolicy>,
 }
 
 impl Channel {
@@ -47,6 +49,7 @@ impl Channel {
         Ok(Channel {
             transport: Arc::new(Mutex::new(transport)),
             interceptors: Vec::new(),
+            retry_policy: None,
         })
     }
 
@@ -76,7 +79,14 @@ impl Channel {
         Ok(Channel {
             transport: Arc::new(Mutex::new(transport)),
             interceptors: Vec::new(),
+            retry_policy: None,
         })
+    }
+
+    /// Attach a retry policy to this channel.  Retries apply to unary RPCs only.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
+        self
     }
 
     /// Register a client-side unary interceptor.
@@ -108,13 +118,54 @@ impl Channel {
         Req: prost::Message,
         Resp: prost::Message + Default,
     {
-        let fut = self.call_unary_inner(method, req, metadata, timeout);
+        let inner_fut = async {
+            let max_attempts = self
+                .retry_policy
+                .as_ref()
+                .map(|p| p.max_attempts.max(1).min(5))
+                .unwrap_or(1);
+
+            let mut last_err = Status::internal("no attempts made");
+
+            for attempt in 0..max_attempts {
+                // Exponential backoff before every attempt after the first.
+                if attempt > 0 {
+                    let backoff = self
+                        .retry_policy
+                        .as_ref()
+                        .map(|p| p.backoff_for_attempt(attempt))
+                        .unwrap_or(Duration::ZERO);
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+
+                match self.call_unary_inner(method, req, metadata, timeout).await {
+                    Ok(r) => return Ok(r),
+                    Err(e) => {
+                        let retryable = self
+                            .retry_policy
+                            .as_ref()
+                            .map(|p| p.is_retryable(e.code))
+                            .unwrap_or(false);
+                        last_err = e;
+                        if !retryable {
+                            break;
+                        }
+                        // retryable: continue to next attempt
+                    }
+                }
+            }
+
+            Err(last_err)
+        };
+
         match timeout {
-            Some(d) => match tokio::time::timeout(d, fut).await {
+            Some(d) => match tokio::time::timeout(d, inner_fut).await {
                 Ok(result) => result,
                 Err(_) => Err(Status::deadline_exceeded("RPC deadline exceeded")),
             },
-            None => fut.await,
+            None => inner_fut.await,
         }
     }
 
@@ -292,6 +343,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use crate::metadata::Metadata;
+    use crate::retry::RetryPolicy;
     use crate::server::{Handler, MethodDesc, Server, ServiceDesc};
     use crate::status::Code;
 
@@ -751,5 +803,104 @@ mod tests {
 
         let err = result.unwrap_err();
         assert_eq!(err.code, crate::status::Code::PermissionDenied);
+    }
+
+    // ── Module 12: Retry policy ──────────────────────────────────────────────
+
+    /// A handler that fails the first N calls with `Unavailable`, then succeeds.
+    fn flaky_handler(fail_times: usize) -> crate::server::UnaryHandlerFn {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        Arc::new(move |_req: Bytes, _md: Metadata| {
+            let counter = Arc::clone(&counter);
+            Box::pin(async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n < fail_times {
+                    Err(Status::unavailable("temporary failure"))
+                } else {
+                    // HelloReply { message: "" } encodes to zero bytes in protobuf.
+                    Ok(Bytes::new())
+                }
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_on_second_attempt() {
+        let addr = start_server(ServiceDesc {
+            name: "test.Retry",
+            methods: vec![MethodDesc {
+                name: "Call",
+                handler: Handler::Unary(flaky_handler(1)),
+            }],
+        }).await;
+
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(10),
+            backoff_multiplier: 2.0,
+            retryable_codes: vec![Code::Unavailable],
+        };
+        let channel = Channel::connect(addr).await.unwrap().with_retry_policy(policy);
+        let (reply, _): (HelloReply, _) = channel
+            .call_unary("/test.Retry/Call", &HelloRequest::default(), &Metadata::new(), None)
+            .await
+            .expect("should succeed after retry");
+        let _ = reply;
+    }
+
+    #[tokio::test]
+    async fn retry_exhausted_returns_last_error() {
+        let addr = start_server(ServiceDesc {
+            name: "test.RetryExhaust",
+            methods: vec![MethodDesc {
+                name: "Call",
+                handler: Handler::Unary(flaky_handler(10)), // always fails
+            }],
+        }).await;
+
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(10),
+            backoff_multiplier: 2.0,
+            retryable_codes: vec![Code::Unavailable],
+        };
+        let channel = Channel::connect(addr).await.unwrap().with_retry_policy(policy);
+        let err = channel
+            .call_unary::<HelloRequest, HelloReply>("/test.RetryExhaust/Call", &HelloRequest::default(), &Metadata::new(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_code_not_retried() {
+        // Handler always returns PermissionDenied; policy only retries Unavailable.
+        let addr = start_server(ServiceDesc {
+            name: "test.NoRetry",
+            methods: vec![MethodDesc {
+                name: "Call",
+                handler: Handler::Unary(Arc::new(|_: Bytes, _: Metadata| {
+                    Box::pin(async { Err(Status::new(Code::PermissionDenied, "denied")) })
+                })),
+            }],
+        }).await;
+
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(10),
+            backoff_multiplier: 2.0,
+            retryable_codes: vec![Code::Unavailable],
+        };
+        let channel = Channel::connect(addr).await.unwrap().with_retry_policy(policy);
+        let err = channel
+            .call_unary::<HelloRequest, HelloReply>("/test.NoRetry/Call", &HelloRequest::default(), &Metadata::new(), None)
+            .await
+            .unwrap_err();
+        // Should fail immediately without exhausting all 5 attempts.
+        assert_eq!(err.code, Code::PermissionDenied);
     }
 }

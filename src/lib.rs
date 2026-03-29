@@ -2,6 +2,7 @@ pub mod client;
 pub mod codec;
 pub mod interceptor;
 pub mod metadata;
+pub mod retry;
 pub mod server;
 pub mod status;
 pub mod tls;
