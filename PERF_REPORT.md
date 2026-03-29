@@ -12,89 +12,94 @@ The Go benchmark uses `google.golang.org/grpc/interop.NewTestServer()` with the
 standard `grpc_testing` proto service. The Rust benchmark uses the same proto
 messages and the same four scenarios.
 
+Both sides use identical HTTP/2 window configuration: 4 MB initial stream window
+and 4 MB initial connection window (see tuning note below).
+
 Benchmark sources:
 - Rust: `src/bin/bench.rs`
 - Go: `/tmp/grpc-go-bench/main.go`
 
 ---
 
-## Results
+## Results (equal tuning — both sides 4 MB H/2 windows)
 
 ### 1. Serial Unary Latency (10,000 sequential EmptyCall RPCs, 1 connection)
 
-| Metric        | grpc-rs   | grpc-go   | Winner    |
-|---------------|-----------|-----------|-----------|
-| RPS           | 32,900    | 29,000    | **rs +13%**   |
-| mean_us       | 30.4      | 34.5      | **rs −12%**   |
-| p50_us        | 28.0      | 31.0      | **rs −10%**   |
-| p90_us        | 38.0      | 47.0      | **rs −19%**   |
-| p99_us        | 52.0      | 78.0      | **rs −33%**   |
-| p999_us       | 68.0      | 193.0     | **rs −65%**   |
+| Metric        | grpc-rs   | grpc-go   | Winner        |
+|---------------|-----------|-----------|---------------|
+| RPS           | 31,994    | 28,205    | **rs +13%**   |
+| mean_us       | 31.3      | 35.5      | **rs −12%**   |
+| p50_us        | 28.0      | 34.0      | **rs −18%**   |
+| p90_us        | 38.0      | 40.0      | **rs −5%**    |
+| p99_us        | 64.0      | 78.0      | **rs −18%**   |
+| p999_us       | 81.0      | 171.0     | **rs −53%**   |
 
-grpc-rs shows consistently lower tail latency. The p99.9 gap (68 µs vs 193 µs) reflects
-the Go GC pauses absent from Rust.
+grpc-rs has consistently lower tail latency. The p99.9 gap (81 µs vs 171 µs)
+reflects Go GC pauses that are absent in Rust.
 
 ---
 
 ### 2. Concurrent Unary Throughput (100 workers × 100 calls, 1 connection per worker)
 
-| Metric        | grpc-rs    | grpc-go    | Winner     |
-|---------------|------------|------------|------------|
-| elapsed_ms    | 51         | 69         | **rs −26%**    |
-| RPS           | 196,000    | 144,000    | **rs +36%**    |
+| Metric        | grpc-rs    | grpc-go    | Winner        |
+|---------------|------------|------------|---------------|
+| elapsed_ms    | 50         | 69         | **rs −28%**   |
+| RPS           | 199,152    | 144,244    | **rs +38%**   |
 
-Each worker uses its own TCP connection. grpc-rs achieves significantly higher
-throughput under concurrent load, benefiting from zero-cost async tasks and
-no stop-the-world GC.
+Each worker uses its own TCP connection. grpc-rs benefits from zero-cost async
+tasks and no stop-the-world GC.
 
 ---
 
 ### 3. Server Streaming Throughput (50 calls × 1,000 msgs × 1 KB, 1 connection)
 
-| Metric        | grpc-rs   | grpc-go   | Winner    |
-|---------------|-----------|-----------|-----------|
-| elapsed_ms    | 55        | 593       | **rs −91%**   |
-| msgs_per_s    | 907,095   | 84,200    | **rs +977%**  |
-| mb_per_s      | 885.8     | 82.2      | **rs +978%**  |
+| Metric        | grpc-rs   | grpc-go   | Winner        |
+|---------------|-----------|-----------|---------------|
+| elapsed_ms    | 55        | 53        | **tie**       |
+| msgs_per_s    | 907,206   | 933,479   | **go +3%**    |
+| mb_per_s      | 885.9     | 911.6     | **go +3%**    |
 
-After increasing HTTP/2 initial window sizes from the default 65,535 bytes to 4 MB
-(both stream-level and connection-level, on both client and server), grpc-rs now
-dominates streaming throughput by ~10×. The default window was the bottleneck:
-the sender had to stop and wait for window-update frames after every ~64 KB,
-stalling the pipe. With 4 MB windows the full 1 MB stream fits without back-pressure.
+With equal window sizes, streaming throughput is essentially identical — the 3%
+difference is within run-to-run noise. Both are saturating loopback TCP bandwidth.
 
 ---
 
 ### 4. Bidi Ping-Pong (50 calls × 500 send/recv rounds, 1 connection)
 
-| Metric        | grpc-rs    | grpc-go    | Winner     |
-|---------------|------------|------------|------------|
-| elapsed_ms    | 597        | 648        | **rs −8%**     |
-| rounds_per_s  | 41,900     | 38,600     | **rs +9%**     |
+| Metric        | grpc-rs    | grpc-go    | Winner        |
+|---------------|------------|------------|---------------|
+| elapsed_ms    | 598        | 563        | **go −6%**    |
+| rounds_per_s  | 41,744     | 44,383     | **go +6%**    |
 
-grpc-rs has a slight edge in the ping-pong pattern where per-message overhead
-and scheduling latency dominate over raw bandwidth.
+grpc-go has a slight edge in ping-pong. Likely due to grpc-go's more mature
+write-batching and buffer reuse in its transport layer.
 
 ---
 
 ## Summary
 
-| Scenario              | grpc-rs       | grpc-go      | Delta      |
-|-----------------------|---------------|--------------|------------|
-| Serial unary          | 32,154 RPS    | 29,000 RPS   | +11%       |
-| Concurrent unary      | 197,560 RPS   | 144,000 RPS  | +37%       |
-| Server streaming      | 885.8 MB/s    | 82.2 MB/s    | +978%      |
-| Bidi ping-pong        | 41,590 r/s    | 38,600 r/s   | +8%        |
+| Scenario          | grpc-rs     | grpc-go     | Delta   |
+|-------------------|-------------|-------------|---------|
+| Serial unary      | 31,994 RPS  | 28,205 RPS  | **rs +13%** |
+| Concurrent unary  | 199,152 RPS | 144,244 RPS | **rs +38%** |
+| Server streaming  | 885.9 MB/s  | 911.6 MB/s  | go +3% (tie) |
+| Bidi ping-pong    | 41,744 r/s  | 44,383 r/s  | go +6%  |
 
-**grpc-rs leads in all four categories** after the H/2 window size fix.
+**grpc-rs wins on unary RPCs** — both throughput and tail latency — primarily
+because Rust has no GC pauses. **Streaming throughput is a tie** once both sides
+use the same H/2 window sizes. **grpc-go has a slight edge on bidi ping-pong**,
+likely due to more mature write-batching in its transport.
 
-The streaming gap was entirely due to the h2 crate's conservative default window
-(65,535 bytes). Setting `initial_window_size` and `initial_connection_window_size`
-to 4 MB on both client and server eliminated all flow-control stalls.
+---
 
 ## H/2 window tuning (applied 2026-03-29)
 
-Both `ServerTransport` and `ClientTransport` now use:
+The h2 crate's default window size is 65,535 bytes (the HTTP/2 spec minimum).
+With 1 KB messages and 1,000 messages per stream, the sender stalls after every
+~64 messages waiting for WINDOW_UPDATE frames — cutting streaming throughput to
+~62 MB/s. Setting both sides to 4 MB eliminates this entirely.
+
+**grpc-rs** (`src/transport/server.rs` + `src/transport/client.rs`):
 ```rust
 h2::{server,client}::Builder::new()
     .initial_window_size(4 * 1024 * 1024)
@@ -102,7 +107,21 @@ h2::{server,client}::Builder::new()
     .handshake(io)
 ```
 
+**grpc-go** (`/tmp/grpc-go-bench/main.go`):
+```go
+grpc.NewServer(
+    grpc.InitialWindowSize(4*1024*1024),
+    grpc.InitialConnWindowSize(4*1024*1024),
+)
+grpc.NewClient(addr,
+    grpc.WithInitialWindowSize(4*1024*1024),
+    grpc.WithInitialConnWindowSize(4*1024*1024),
+)
+```
+
+---
+
 ## Next steps
 
-Profile with `sudo cargo flamegraph --bin bench` to confirm no remaining bottlenecks
-in the codec or tokio scheduler under sustained streaming load.
+Profile with `sudo cargo flamegraph --bin bench` to identify any remaining
+bottlenecks in the codec or tokio scheduler under sustained streaming load.
